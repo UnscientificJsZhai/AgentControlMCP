@@ -79,10 +79,17 @@ export async function recover(store: SqliteStore) {
           });
       }
     for (const session of await store.list<SessionRecord>('session'))
-      if (session.instanceId === instance.id && session.state !== 'deleted') {
-        const next = { ...session, state: 'interrupted', revision: session.revision + 1 };
-        delete next.activeTaskId;
-        puts.push(row('session', next));
+      if (session.instanceId === instance.id) {
+        if (session.state === 'creating' || session.state === 'ready') {
+          const next: SessionRecord = {
+            ...session,
+            state: 'interrupted',
+            revision: session.revision + 1,
+          };
+          delete next.activeTaskId;
+          puts.push(row('session', next));
+        }
+        // 保留会话终态，同时清理仍由原运行时持有的遗留租约。
         releases.push({
           key: `session:${digest([session.namespace, session.downstreamSessionId])}`,
           holder: session.runtimeId,
