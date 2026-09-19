@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.test-dist/
+coverage/
+doc/
+tmp/
+out-tsc/
+.idea/
+.vscode/
+.eslintcache
+*.tsbuildinfo
+package-lock.json
