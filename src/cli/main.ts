@@ -16,9 +16,10 @@ import type { InstanceRecord, InteractionRecord } from '../domain/models.js';
 import { AppError, errorDetail, fail } from '../domain/errors.js';
 import { id } from '../domain/ids.js';
 import { createTools } from '../transport/mcp/tools.js';
+import { createMcpTools, describeTool } from '../transport/mcp/catalog.js';
 
-const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识>\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content <子命令>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出所有工具及参数 Schema）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
-const flags = new Set(['json', 'help', 'no-wait', 'interactive', 'yes']);
+const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识>\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content <子命令>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出全部 CLI 操作及参数 Schema）\ntools --mcp （输出实际公开的 MCP 工具及参数 Schema）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
+const flags = new Set(['json', 'help', 'no-wait', 'interactive', 'yes', 'mcp']);
 function parse(argv: string[]) {
   const positional: string[] = [];
   const options: Record<string, string | boolean> = {};
@@ -114,11 +115,13 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (group === 'tools') {
     output(
-      createTools({} as Container).map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: z.toJSONSchema(tool.schema),
-      })),
+      options.mcp
+        ? createMcpTools({} as Container).map(describeTool)
+        : createTools({} as Container).map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: z.toJSONSchema(tool.schema),
+          })),
     );
     return;
   }

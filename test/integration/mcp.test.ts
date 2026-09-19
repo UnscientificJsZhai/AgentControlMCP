@@ -13,6 +13,7 @@ import { Container } from '../../src/bootstrap/container.js';
 import { startHttp } from '../../src/transport/mcp/serve.js';
 import { until } from '../helpers/harness.js';
 import { id } from '../../src/domain/ids.js';
+import { createMcpTools, describeTool } from '../../src/transport/mcp/catalog.js';
 
 for (const era of ['modern', 'legacy'] as const)
   for (const transport of ['stdio', 'http'] as const)
@@ -79,7 +80,10 @@ for (const era of ['modern', 'legacy'] as const)
             assert.equal(origin.status, 403);
           }
           const list = await client.listTools();
-          assert.equal(list.tools.length, 62);
+          assert.equal(list.tools.length, 30);
+          assert.deepEqual(list.tools, createMcpTools({} as Container).map(describeTool));
+          assert.ok(Buffer.byteLength(JSON.stringify(list.tools)) <= 30 * 1024);
+          await assert.rejects(client.callTool({ name: 'agent_register', arguments: {} }));
           const call = async (name: string, args: Record<string, unknown> = {}) => {
             const raw = await client.callTool({ name, arguments: args });
             const result = raw.structuredContent as {
@@ -90,27 +94,36 @@ for (const era of ['modern', 'legacy'] as const)
             assert.equal(result.ok, true, JSON.stringify(result));
             return result.data;
           };
-          const info = await call('connector_info');
+          const info = await call('management_read', { action: 'connector_info', arguments: {} });
           assert.ok(String(info.principalId).includes('acceptance'));
-          const registered = await call('agent_register', {
-            config: {
-              name: 'MCP 验收',
-              origin: { kind: 'manual' },
-              launch: {
-                kind: 'command',
-                executable: process.execPath,
-                args: [resolve('.test-dist/test/fixtures/acp-agent.js')],
+          const description = await call('management_describe', { action: 'agent_register' });
+          assert.equal(description.toolName, 'management_write');
+          assert.ok(description.inputSchema);
+          const registered = await call(String(description.toolName), {
+            action: 'agent_register',
+            arguments: {
+              config: {
+                name: 'MCP 验收',
+                origin: { kind: 'manual' },
+                launch: {
+                  kind: 'command',
+                  executable: process.execPath,
+                  args: [resolve('.test-dist/test/fixtures/acp-agent.js')],
+                },
+                cwd: dir,
               },
-              cwd: dir,
+              idempotencyKey: id('register'),
             },
-            idempotencyKey: id('register'),
           });
           const created = await call('session_create', {
             configId: registered.configId,
             idempotencyKey: id('create'),
           });
           const sessionOp = await until(async () => {
-            const op = await call('operation_get', { operationId: created.operationId });
+            const op = await call('operation_wait', {
+              operationId: created.operationId,
+              timeoutMs: 100,
+            });
             if (op.state === 'failed') assert.fail(JSON.stringify(op));
             return op.state === 'completed' ? op : null;
           });
@@ -121,7 +134,7 @@ for (const era of ['modern', 'legacy'] as const)
             idempotencyKey: id('prompt'),
           });
           const done = await until(async () => {
-            const state = await call('task_get', { taskId: task.taskId });
+            const state = await call('task_wait', { taskId: task.taskId, timeoutMs: 100 });
             return ['completed', 'failed'].includes(String(state.state)) ? state : null;
           });
           assert.equal(done.state, 'completed', JSON.stringify(done));

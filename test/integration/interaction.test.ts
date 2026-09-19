@@ -39,7 +39,7 @@ void test(
         assert.equal(result.ok, true, JSON.stringify(output));
         return result.data;
       };
-      await call('connector_info', {});
+      await call('management_read', { action: 'connector_info', arguments: {} });
       const session = await h.operation<{ sessionId: string }>(
         call('session_create', {
           configId: h.registered.configId,

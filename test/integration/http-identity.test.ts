@@ -67,12 +67,15 @@ void test(
       const denied = await other.callTool({ name: 'session_get', arguments: { sessionId } });
       assert.equal((denied.structuredContent as { ok: boolean }).ok, false);
       const current = await call(reconnected, 'session_get', { sessionId });
-      await call(reconnected, 'session_share', {
-        sessionId,
-        principalId: b.principalId,
-        access: 'read',
-        expectedRevision: current.revision,
-        idempotencyKey: id('share'),
+      await call(reconnected, 'management_write', {
+        action: 'session_share',
+        arguments: {
+          sessionId,
+          principalId: b.principalId,
+          access: 'read',
+          expectedRevision: current.revision,
+          idempotencyKey: id('share'),
+        },
       });
       await call(other, 'session_get', { sessionId });
       const rotated = await h.app.identities.issue(a.principalId, true);

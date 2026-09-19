@@ -25,7 +25,7 @@
     "test:management": "npm run build && npm run test:compile && node --test .test-dist/test/integration/management.test.js",
     "test:installers": "npm run test:compile && node --test .test-dist/test/integration/installers.test.js",
     "test:acp": "npm run test:compile && node --test .test-dist/test/integration/runtime.test.js",
-    "test:mcp": "npm run build && npm run test:compile && node --test .test-dist/test/integration/mcp.test.js .test-dist/test/integration/interaction.test.js",
+    "test:mcp": "npm run build && npm run test:compile && node --test .test-dist/test/integration/mcp.test.js .test-dist/test/integration/mcp-management.test.js .test-dist/test/integration/interaction.test.js",
     "test:recovery": "npm run build && npm run test:compile && node --test .test-dist/test/integration/recovery.test.js",
     "build:windows-host": "node scripts/build-windows-host.mjs",
     "prepack": "npm run build && node scripts/check-package.mjs",
@@ -61,7 +61,8 @@
   "files": [
     "dist",
     "native/win32-*/*.exe",
-    "docs/acceptance.md"
+    "docs/acceptance.md",
+    "docs/mcp-tools.md"
   ],
   "exports": {
     ".": "./dist/index.js"

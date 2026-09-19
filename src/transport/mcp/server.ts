@@ -11,7 +11,8 @@ import type { Container } from '../../bootstrap/container.js';
 import type { Context } from '../../domain/models.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import { digest } from '../../domain/ids.js';
-import { createTools, invoke } from './tools.js';
+import { invoke } from './tools.js';
+import { createMcpTools, toolAnnotations } from './catalog.js';
 
 const presentations = new WeakMap<
   Container,
@@ -31,7 +32,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
       capabilities: { tools: {}, resources: {} },
     },
   );
-  const definitions = createTools(app);
+  const definitions = createMcpTools(app);
   if (!presentations.has(app)) presentations.set(app, new Map());
   async function present(ctx: Context, input: unknown, request: ServerContext) {
     const { interactionId } = z.strictObject({ interactionId: z.string() }).parse(input);
@@ -132,11 +133,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
       {
         description: definition.description,
         inputSchema: definition.schema,
-        annotations: {
-          readOnlyHint: definition.readOnly,
-          destructiveHint: definition.destructive,
-          openWorldHint: true,
-        },
+        annotations: toolAnnotations(definition),
       },
       async (args, request) => {
         const capabilities = server.server.getClientCapabilities();

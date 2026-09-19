@@ -26,6 +26,8 @@ export interface ToolDefinition {
   schema: z.ZodType;
   readOnly: boolean;
   destructive: boolean;
+  openWorld?: boolean;
+  resolveOperation?: (input: unknown) => { definition: ToolDefinition; input: unknown };
   run: (ctx: Context, input: unknown) => Promise<unknown>;
 }
 const target = z.union([z.strictObject({ runtimeId: text }), z.strictObject({ sessionId: text })]);
@@ -944,16 +946,30 @@ export async function invoke(
 ) {
   const requestId = id('request');
   try {
-    await app.identities.check(ctx);
-    const definition = definitions.find((tool) => tool.name === name);
-    if (!definition) fail('CONFIG_INVALID', '工具不存在。', { name });
-    const data = await definition.run(ctx, args);
-    await app.identities.check(ctx);
-    if (definition.readOnly) await reauthorizeResult(app, ctx, name, args, data);
+    const data = await executeTool(app, definitions, ctx, name, args);
     return { ok: true as const, data, meta: { requestId, warnings: [] } };
   } catch (error) {
     return { ok: false as const, error: errorDetail(error), meta: { requestId } };
   }
+}
+
+// 先解析合并入口的实际目标，最后一次身份检查和 ACL 复核必须使用原操作参数。
+async function executeTool(
+  app: Container,
+  definitions: ToolDefinition[],
+  ctx: Context,
+  name: string,
+  args: unknown,
+) {
+  await app.identities.check(ctx);
+  const definition = definitions.find((tool) => tool.name === name);
+  if (!definition) fail('CONFIG_INVALID', '工具不存在。', { name });
+  const target = definition.resolveOperation?.(args) ?? { definition, input: args };
+  const data = await target.definition.run(ctx, target.input);
+  await app.identities.check(ctx);
+  if (target.definition.readOnly)
+    await reauthorizeResult(app, ctx, target.definition.name, target.input, data);
+  return data;
 }
 
 // 异步磁盘读取和等待结束后复核当前归属，阻止移交期间的在途结果泄露。

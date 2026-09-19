@@ -172,19 +172,22 @@ void test(
         assert.equal(result.ok, true, JSON.stringify(raw));
         return result.data;
       };
-      const config = await call('agent_register', {
-        config: {
-          name: 'tree',
-          origin: { kind: 'manual' },
-          cwd: root,
-          launch: {
-            kind: 'command',
-            executable: process.execPath,
-            args: [resolve('.test-dist/test/fixtures/acp-agent.js')],
+      const config = await call('management_write', {
+        action: 'agent_register',
+        arguments: {
+          config: {
+            name: 'tree',
+            origin: { kind: 'manual' },
+            cwd: root,
+            launch: {
+              kind: 'command',
+              executable: process.execPath,
+              args: [resolve('.test-dist/test/fixtures/acp-agent.js')],
+            },
+            environment: { values: { FIXTURE_AUDIT: { kind: 'literal', value: audit } } },
           },
-          environment: { values: { FIXTURE_AUDIT: { kind: 'literal', value: audit } } },
+          idempotencyKey: id('c'),
         },
-        idempotencyKey: id('c'),
       });
       const accepted = await call('session_create', {
         configId: config.configId,
@@ -195,7 +198,10 @@ void test(
         return op.state === 'completed' ? op : null;
       });
       const session = op.result as { sessionId: string; runtimeId: string };
-      const runtime = await call('runtime_get', { runtimeId: session.runtimeId });
+      const runtime = await call('management_read', {
+        action: 'runtime_get',
+        arguments: { runtimeId: session.runtimeId },
+      });
       const task = await call('task_submit', {
         sessionId: session.sessionId,
         prompt: [{ type: 'text', text: 'tree slow' }],
