@@ -18,3 +18,5 @@ yarn-error.log*
 .eslintcache
 *.tsbuildinfo
 .DS_Store
+/native/win32-*/
+/agent-control-mcp-*.tgz

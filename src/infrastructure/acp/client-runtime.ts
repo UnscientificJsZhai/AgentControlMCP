@@ -1,0 +1,233 @@
+import { client, ndJsonStream, RequestError } from '@agentclientprotocol/sdk';
+import type {
+  AgentRequestMethod,
+  AgentRequestParamsByMethod,
+  AgentRequestResponsesByMethod,
+  ClientCapabilities,
+  ClientConnection,
+  ClientRequestMethod,
+  ClientRequestResponsesByMethod,
+  InitializeResponse,
+} from '@agentclientprotocol/sdk';
+import { Readable, Writable, Transform } from 'node:stream';
+import { AppError, fail } from '../../domain/errors.js';
+import { ProcessHost } from '../platform/process-host.js';
+import type { LaunchSpec } from '../platform/process-host.js';
+import { redact } from '../platform/environment.js';
+
+export const stableRequests = [
+  'initialize',
+  'authenticate',
+  'logout',
+  'session/new',
+  'session/load',
+  'session/list',
+  'session/delete',
+  'session/resume',
+  'session/close',
+  'session/set_mode',
+  'session/set_config_option',
+  'session/prompt',
+] as const;
+export interface CallbackPorts {
+  request: (
+    method: ClientRequestMethod,
+    params: unknown,
+    signal: AbortSignal,
+    requestId: string | number | null,
+  ) => Promise<unknown>;
+  notify: (method: string, params: unknown) => Promise<void>;
+  responded: (requestId: string | number | null) => Promise<void>;
+  exited: () => Promise<void>;
+}
+export class ClientRuntime {
+  readonly connection: ClientConnection;
+  initialize!: InitializeResponse;
+  private notifications: Promise<void> = Promise.resolve();
+  private notificationError: unknown;
+  private constructor(
+    readonly host: ProcessHost,
+    readonly secrets: string[],
+    ports: CallbackPorts,
+  ) {
+    const app = client();
+    const request = <M extends ClientRequestMethod>(
+      method: M,
+      params: unknown,
+      signal: AbortSignal,
+      requestId: string | number | null,
+    ): Promise<ClientRequestResponsesByMethod[M]> =>
+      ports.request(method, params, signal, requestId) as Promise<
+        ClientRequestResponsesByMethod[M]
+      >;
+    app.onRequest('session/request_permission', (ctx) =>
+      request('session/request_permission', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('fs/read_text_file', (ctx) =>
+      request('fs/read_text_file', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('fs/write_text_file', (ctx) =>
+      request('fs/write_text_file', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('terminal/create', (ctx) =>
+      request('terminal/create', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('terminal/output', (ctx) =>
+      request('terminal/output', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('terminal/wait_for_exit', (ctx) =>
+      request('terminal/wait_for_exit', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('terminal/kill', (ctx) =>
+      request('terminal/kill', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('terminal/release', (ctx) =>
+      request('terminal/release', ctx.params, ctx.signal, ctx.requestId),
+    );
+    app.onRequest('elicitation/create', (ctx) =>
+      request('elicitation/create', ctx.params, ctx.signal, ctx.requestId),
+    );
+    const notification = (method: string, params: unknown) => {
+      this.notifications = this.notifications
+        .then(() => ports.notify(method, redact(params, secrets)))
+        .catch((error: unknown) => {
+          this.notificationError = error;
+          void this.host.stop();
+        });
+      return this.notifications;
+    };
+    app.onNotification('session/update', (ctx) => notification('session/update', ctx.params));
+    app.onNotification('elicitation/complete', (ctx) =>
+      notification('elicitation/complete', ctx.params),
+    );
+    let frameBytes = 0;
+    const bounded = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        for (const byte of chunk) {
+          frameBytes = byte === 10 ? 0 : frameBytes + 1;
+          if (frameBytes > 16 * 1024 ** 2) {
+            callback(new AppError('PROTOCOL_ERROR', 'ACP 消息超过 16 MiB。'));
+            return;
+          }
+        }
+        callback(null, chunk);
+      },
+    });
+    bounded.on('error', () => {
+      void host.stop();
+    });
+    host.stdout.pipe(bounded);
+    const stream = ndJsonStream(
+      Writable.toWeb(host.stdin),
+      Readable.toWeb(bounded) as ReadableStream<Uint8Array>,
+    );
+    const writer = stream.writable.getWriter();
+    this.connection = app.connect({
+      readable: stream.readable,
+      writable: new WritableStream({
+        async write(message) {
+          await writer.write(message);
+          if ('id' in message && ('result' in message || 'error' in message))
+            await ports.responded(message.id);
+        },
+        close: () => writer.close(),
+        abort: (reason) => writer.abort(reason),
+      }),
+    });
+    host.stderr.resume();
+    void host.closed.then(() => ports.exited()).catch(() => {});
+  }
+  static async start(
+    spec: LaunchSpec,
+    secrets: string[],
+    capabilities: ClientCapabilities,
+    ports: CallbackPorts,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ) {
+    if (signal?.aborted) fail('CANCELLED', '初始化在启动前已取消。');
+    const runtime = new ClientRuntime(await ProcessHost.start(spec), secrets, ports);
+    try {
+      runtime.initialize = await runtime.request(
+        'initialize',
+        {
+          protocolVersion: 1,
+          clientCapabilities: capabilities,
+          clientInfo: { name: 'agent-control-mcp', version: '1.0.0' },
+        },
+        timeoutMs,
+        signal,
+      );
+      if (runtime.initialize.protocolVersion !== 1) fail('PROTOCOL_ERROR', '下游未接受 ACP v1。');
+      return runtime;
+    } catch (error) {
+      await runtime.close();
+      throw error;
+    }
+  }
+  async request<M extends AgentRequestMethod>(
+    method: M,
+    params: AgentRequestParamsByMethod[M],
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentRequestResponsesByMethod[M]> {
+    if (!(stableRequests as readonly string[]).includes(method))
+      fail('CAPABILITY_UNSUPPORTED', '此方法不属于稳定 ACP 基线。');
+    if (signal?.aborted) fail('CANCELLED', 'ACP 请求在派发前已取消。');
+    const cancellation = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    let rejectAbort: ((error: unknown) => void) | undefined;
+    const onAbort = () => {
+      cancellation.abort();
+      rejectAbort?.(new AppError('CANCELLED', 'ACP 请求等待已取消，副作用结果可能未知。'));
+    };
+    try {
+      const request = this.connection.agent.request(method, params, {
+        cancellationSignal: cancellation.signal,
+      });
+      const interrupted = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject;
+        if (timeoutMs)
+          timer = setTimeout(() => {
+            cancellation.abort();
+            reject(new AppError('TIMEOUT', 'ACP 请求超时，不能自动重试。'));
+          }, timeoutMs);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
+      const result = await Promise.race([request, interrupted]);
+      await this.barrier();
+      return redact(result, this.secrets);
+    } catch (error) {
+      if (error instanceof RequestError)
+        throw new AppError(
+          error.code === -32000
+            ? 'AUTH_REQUIRED'
+            : error.code === -32601
+              ? 'CAPABILITY_UNSUPPORTED'
+              : 'PROTOCOL_ERROR',
+          '下游返回 ACP 错误。',
+          { acpCode: error.code },
+        );
+      if (error instanceof AppError) throw error;
+      throw new AppError('DOWNSTREAM_EXITED', 'ACP 连接已结束或响应无效。');
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+  async barrier() {
+    await this.notifications;
+    if (this.notificationError)
+      throw this.notificationError instanceof Error
+        ? this.notificationError
+        : new AppError('PROTOCOL_ERROR', '通知处理失败。');
+  }
+  cancel(sessionId: string) {
+    return this.connection.agent.notify('session/cancel', { sessionId });
+  }
+  async close() {
+    this.connection.close();
+    await this.host.stop();
+  }
+}

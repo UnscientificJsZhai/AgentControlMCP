@@ -17,19 +17,54 @@
     "lint:fix": "eslint . --fix --max-warnings 0",
     "format:check": "prettier . --check",
     "format": "prettier . --write",
-    "test": "npm run test:unit",
-    "test:unit": "node scripts/clean.mjs test && tsc -p tsconfig.test.json && node --test \".test-dist/test/unit/**/*.test.js\"",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm run build && npm test"
+    "test": "npm run test:compile && node --test \".test-dist/test/unit/**/*.test.js\" \".test-dist/test/integration/**/*.test.js\"",
+    "test:unit": "npm run test:compile && node --test \".test-dist/test/unit/**/*.test.js\"",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run build && npm test",
+    "test:compile": "node scripts/clean.mjs test && tsc -p tsconfig.test.json && node scripts/prepare-test.mjs",
+    "test:integration": "npm run build && npm run test:compile && node --test \".test-dist/test/integration/**/*.test.js\"",
+    "test:management": "npm run build && npm run test:compile && node --test .test-dist/test/integration/management.test.js",
+    "test:installers": "npm run test:compile && node --test .test-dist/test/integration/installers.test.js",
+    "test:acp": "npm run test:compile && node --test .test-dist/test/integration/runtime.test.js",
+    "test:mcp": "npm run build && npm run test:compile && node --test .test-dist/test/integration/mcp.test.js .test-dist/test/integration/interaction.test.js",
+    "test:recovery": "npm run build && npm run test:compile && node --test .test-dist/test/integration/recovery.test.js",
+    "build:windows-host": "node scripts/build-windows-host.mjs",
+    "prepack": "npm run build && node scripts/check-package.mjs",
+    "pretest": "npm run build"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "tar": "7.5.22",
+    "unbzip2-stream": "1.4.3",
+    "yauzl": "3.4.0",
+    "zod": "4.2.0"
+  },
   "devDependencies": {
+    "@digitaldefiance/bzip2-wasm": "1.1.1",
     "@eslint/js": "10.0.1",
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "24.13.6",
+    "@types/unbzip2-stream": "1.4.3",
+    "@types/yauzl": "3.4.0",
     "eslint": "10.11.0",
     "eslint-config-prettier": "10.1.8",
     "globals": "17.12.0",
+    "mcp-legacy": "npm:@modelcontextprotocol/sdk@1.30.0",
     "prettier": "3.9.8",
     "typescript": "6.0.3",
     "typescript-eslint": "8.70.0"
-  }
+  },
+  "bin": {
+    "agent-control-mcp": "dist/cli/entry.js"
+  },
+  "files": [
+    "dist",
+    "native/win32-*/*.exe",
+    "docs/acceptance.md"
+  ],
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "license": "UNLICENSED"
 }

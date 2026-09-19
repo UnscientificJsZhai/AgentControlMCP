@@ -13,10 +13,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-host:
+    name: 构建 Windows 进程宿主
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.16.0'
+      - name: MSVC 编译 x64 和 ARM64
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "ACM_VS_ROOT=%%i"
+          call "%ACM_VS_ROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          node scripts/build-windows-host.mjs x64
+          if errorlevel 1 exit /b 1
+          call "%ACM_VS_ROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64_arm64
+          node scripts/build-windows-host.mjs arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-process-host
+          path: |
+            native/win32-x64/process-host.exe
+            native/win32-arm64/process-host.exe
+          if-no-files-found: error
   check:
+    needs: windows-host
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -39,5 +67,12 @@ jobs:
           cache-dependency-path: package-lock.json
       - name: 安装锁定依赖
         run: npm ci
+      - name: 获取本次源码编译的进程宿主
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-process-host
+          path: native
       - name: 运行工程检查
         run: npm run check
+      - name: 检查 npm 打包内容
+        run: npm pack --dry-run
