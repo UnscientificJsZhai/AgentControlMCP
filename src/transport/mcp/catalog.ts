@@ -3,6 +3,7 @@ import type { Container } from '../../bootstrap/container.js';
 import { createTools } from './tools.js';
 import type { ToolDefinition } from './tools.js';
 
+// 高频会话工作流直接公开；低频管理操作通过分类入口提供，减少客户端默认加载的工具数量。
 const directNames = new Set([
   'agent_list',
   'agent_get',
@@ -72,6 +73,7 @@ const managementNames = new Set([
   'history_cleanup',
 ]);
 
+/** MCP 注解帮助客户端呈现风险；它们不是授权机制，业务层仍需执行完整权限检查。 */
 export function toolAnnotations(tool: ToolDefinition) {
   return {
     readOnlyHint: tool.readOnly,
@@ -100,6 +102,10 @@ function managementToolName(tool: ToolDefinition) {
       : 'management_write';
 }
 
+/**
+ * 从内部完整操作目录派生公开 MCP 目录；CLI 仍可使用原操作名。
+ * 管理入口先限制 action 分类，再交给原工具 Schema 校验 arguments，避免弱化参数约束。
+ */
 export function createMcpTools(app: Container): ToolDefinition[] {
   const operations = createTools(app);
   const management = operations.filter((tool) => managementNames.has(tool.name));
@@ -139,6 +145,7 @@ export function createMcpTools(app: Container): ToolDefinition[] {
       action: z.enum(allowed.map((tool) => tool.name)),
       arguments: z.record(z.string(), z.unknown()),
     });
+    // 保留原操作定义和输入，调用后的权限复核才能知道结果实际属于哪个会话或任务。
     const resolveOperation = (input: unknown) => {
       const args = schema.parse(input);
       return {

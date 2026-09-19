@@ -3,12 +3,15 @@ import { lstat, open, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fail } from '../../domain/errors.js';
 
+/** 使用相对路径边界判断，避免简单字符串前缀把 /work-other 误认为 /work 的子目录。 */
 export function inside(root: string, path: string) {
   const suffix = relative(root, path);
   return (
     suffix === '' || (!suffix.startsWith(`..${sep}`) && suffix !== '..' && !isAbsolute(suffix))
   );
 }
+
+/** 以 realpath 后的根目录与目标校验授权；新文件只允许写入已存在且获授权的父目录。 */
 export async function checkedPath(path: string, roots: string[], write = false): Promise<string> {
   if (!isAbsolute(path)) fail('ACCESS_DENIED', '文件回调只接受宿主绝对路径。');
   const canonicalRoots = await Promise.all(roots.map((root) => realpath(root)));
@@ -24,6 +27,8 @@ export async function checkedPath(path: string, roots: string[], write = false):
     fail('ACCESS_DENIED', '文件路径超出会话授权目录。');
   return target;
 }
+
+/** 打开后复核设备号和 inode，减少检查与使用之间目标被替换的风险；行号从 1 开始。 */
 export async function readText(
   path: string,
   roots: string[],
@@ -50,6 +55,8 @@ export async function readText(
     await handle.close();
   }
 }
+
+/** 先打开并复核文件身份，再截断写入；不能在复核前使用 O_TRUNC 破坏原文件内容。 */
 export async function writeText(path: string, content: string, roots: string[]) {
   if (Buffer.byteLength(content) > 16 * 1024 ** 2) fail('CAPACITY_EXCEEDED', '写入内容超过上限。');
   const target = await checkedPath(path, roots, true);

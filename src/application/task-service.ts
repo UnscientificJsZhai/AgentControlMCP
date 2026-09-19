@@ -11,22 +11,27 @@ import { validatePrompt } from '../infrastructure/acp/capability-gate.js';
 import type { SessionService } from './session-service.js';
 import { idem } from './common.js';
 
+/** 将一次 prompt 转为持久化任务；请求返回任务 ID 后，下游执行由本实例继续持有。 */
 export class TaskService {
   private readonly active = new Map<string, Promise<void>>();
   cancelInteractions: (runtimeId: string, taskId?: string) => Promise<void> = async () => {};
   capacityCleanup: () => Promise<void> = async () => {};
   capacityUsage: () => Promise<number> = async () =>
     (await this.store.call<{ bytes: number }>('usage', {})).bytes;
+
   constructor(
     readonly store: SqliteStore,
     readonly sessions: SessionService,
   ) {}
+
   async get(ctx: Context, taskId: string, control = false) {
     const task = await this.store.get<WorkRecord & { purged?: boolean }>('task', taskId);
     if (!task?.sessionId) return fail('OBJECT_NOT_FOUND', '任务不存在。');
     await this.sessions.get(ctx, task.sessionId, control ? 'control' : 'read');
     return task;
   }
+
+  /** 在会话串行区内完成幂等检查、容量准入和 prompt 租约，再安排实际派发。 */
   async submit(
     ctx: Context,
     args: { sessionId: string; prompt: ContentBlock[]; idempotencyKey: string },
@@ -69,6 +74,7 @@ export class TaskService {
         runtimeId: record.id,
       };
       const response = { taskId: task.id, state: 'accepted', revision: 1 };
+      // 任务、会话占用和幂等响应必须同事务保存，重试才不会创建第二次 prompt。
       await this.store.commit({
         checks: [{ kind: 'session', id: session.id, revision: session.revision }],
         puts: [
@@ -87,11 +93,13 @@ export class TaskService {
         ],
         idempotency: idem(ctx, 'task_submit', args, response),
       });
+      // 先返回 accepted；真正发送前再次检查状态，让尚未派发的取消可以直接撤销任务。
       const pending = new Promise<void>((resolve) => setImmediate(resolve)).then(async () => {
         try {
           const dispatched = await this.sessions.serial.run(session.id, async () => {
             const current = await this.store.get<WorkRecord>('task', task.id);
             if (!current || current.state !== 'accepted') return null;
+            // 发往下游前记录 unknown；此后崩溃无法证明副作用未发生，恢复时不能重放。
             await this.store.commit({
               checks: [{ kind: 'task', id: task.id, revision: current.revision }],
               puts: [
@@ -140,6 +148,7 @@ export class TaskService {
       return response;
     });
   }
+
   async update(taskId: string, patch: Partial<WorkRecord>) {
     const record = await this.store.get<WorkRecord>('task', taskId);
     if (!record?.sessionId) return;
@@ -154,6 +163,8 @@ export class TaskService {
       return next;
     });
   }
+
+  /** 终态只提交一次；释放会话 prompt 租约和容量名额时同时清除 activeTaskId。 */
   async finish(taskId: string, patch: Partial<WorkRecord>) {
     const record = await this.store.get<WorkRecord>('task', taskId);
     if (!record?.sessionId) return;
@@ -176,6 +187,8 @@ export class TaskService {
       });
     });
   }
+
+  /** 等待修订变化、交互或终态；客户端停止等待不会取消后台任务，返回前重新授权。 */
   async wait(
     ctx: Context,
     args: { taskId: string; afterRevision?: number | undefined; timeoutMs?: number | undefined },
@@ -200,6 +213,8 @@ export class TaskService {
       timedOut: !terminalStates.has(current.state) && Date.now() >= deadline,
     };
   }
+
+  /** 未发送任务直接结束；已发送任务先通知 ACP 取消，五秒后仍未结束则回收 Runtime。 */
   async cancel(ctx: Context, taskId: string) {
     const task = await this.get(ctx, taskId, true);
     let downstreamSessionId = '';
@@ -261,6 +276,8 @@ export class TaskService {
       state: (await this.store.get<WorkRecord>('task', taskId))?.state ?? state,
     };
   }
+
+  /** 进程退出只能证明执行被中断，不能把尚未确认的副作用改写为未发送。 */
   async exited(runtimeId: string) {
     for (const task of await this.store.list<WorkRecord>('task'))
       if (task.runtimeId === runtimeId && !terminalStates.has(task.state))
@@ -269,6 +286,7 @@ export class TaskService {
           error: errorDetail(new AppError('DOWNSTREAM_EXITED', '下游进程已退出。')),
         });
   }
+
   async close() {
     await Promise.allSettled([...this.active.values()]);
   }

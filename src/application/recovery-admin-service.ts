@@ -26,6 +26,8 @@ export class RecoveryAdminService {
       serviceId: string;
     },
   ) {}
+
+  /** 管理诊断隐藏握手 nonce；进程存活只是观测结果，不证明 PID 仍对应原实例。 */
   async inspect() {
     const instances = (await this.app.store.list<InstanceRecord>('instance')).map(
       ({ nonce: _nonce, ...item }) => ({ ...item, processAlive: isAlive(item.pid) }),
@@ -36,6 +38,8 @@ export class RecoveryAdminService {
       sessions: await this.app.store.list<SessionRecord>('session'),
     };
   }
+
+  /** 本实例可直接关闭活动句柄，其他实例必须确认进程退出后才能修复其持久化状态。 */
   async resolve(args: {
     runtimeId?: string | undefined;
     instanceId?: string | undefined;
@@ -60,6 +64,11 @@ export class RecoveryAdminService {
       );
     return recover(this.app.store);
   }
+
+  /**
+   * 为已有下游会话建立关闭状态的本地映射，并校验命名空间与目标所有者。
+   * 此步骤不连接 Agent；是否真实存在且可恢复，仍由后续显式 load/resume 验证。
+   */
   async adopt(args: {
     configId: string;
     expectedRevision: number;

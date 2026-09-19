@@ -4,6 +4,7 @@ import type { RpcRequest, RpcResponse, Transaction } from './protocol.js';
 import { AppError, fail } from '../../domain/errors.js';
 import { now } from '../../domain/ids.js';
 
+// 同步数据库只在 Worker 内运行；WAL 支持多实例读取，FULL 同步用于持久化已受理的操作。
 const { path } = workerData as { path: string };
 const db = new DatabaseSync(path);
 db.exec(
@@ -26,9 +27,12 @@ COMMIT;`);
 function decode(row: Record<string, unknown> | undefined): unknown {
   return row ? (JSON.parse(row.data as string) as unknown) : null;
 }
+
+/** 先取得 SQLite 写锁再检查业务条件，保证不同服务实例不能同时通过同一资源的准入。 */
 function transaction(input: Transaction) {
   db.exec('BEGIN IMMEDIATE');
   try {
+    // 重放必须先于修订与容量检查：首次提交已改变这些状态，合法重试仍应返回原响应。
     const idem = input.idempotency;
     if (idem) {
       const old = db
@@ -67,6 +71,7 @@ function transaction(input: Transaction) {
         .all(prefix.length, prefix);
       if (refs.length) fail('OBJECT_IN_USE', '对象仍有活动引用。', { references: refs });
     }
+    // 同一事务可把指定持有者的 claim 交给新持有者，其他占用一律视为冲突。
     for (const claim of input.claims ?? []) {
       const previous = db.prepare('SELECT holder FROM claims WHERE key=?').get(claim.key);
       if (
@@ -104,6 +109,7 @@ function transaction(input: Transaction) {
   }
 }
 
+/** 事件序号、事件体、分段体积与会话投影同事务更新，避免查询到没有对应事件的新状态。 */
 function eventAppend(args: {
   streamId: string;
   taskId?: string;
@@ -159,6 +165,7 @@ function eventAppend(args: {
   }
 }
 
+/** 在同一读快照内固定高水位，读取 limit + 1 条用于判断是否还有下一页。 */
 function eventRead(args: {
   streamId: string;
   after: string;
@@ -189,6 +196,7 @@ function eventRead(args: {
       )
       .all(...values, args.limit + 1);
     values[2] = rows.length > args.limit ? ((rows[args.limit - 1]?.seq as string) ?? high) : high;
+    // 连续序号减去行号后拥有相同分组键，可将逐条墓碑压缩成可报告的缺失区间。
     const missing = db
       .prepare(
         `WITH gaps AS (SELECT seq,seq-row_number() OVER (ORDER BY seq) AS grp FROM tombstones WHERE ${where.join(' AND ')}) SELECT CAST(min(seq) AS TEXT) AS 'from',CAST(max(seq) AS TEXT) AS 'to' FROM gaps GROUP BY grp ORDER BY min(seq)`,
@@ -206,6 +214,7 @@ function eventRead(args: {
   }
 }
 
+/** 清理保留事件墓碑与对象身份，只移除结果正文；既能报告游标缺口，也能阻止幂等重执行。 */
 function purge(args: {
   taskIds: string[];
   operationIds: string[];
@@ -252,6 +261,7 @@ function purge(args: {
   }
 }
 
+// 所有消息同步完成后才回复；SQL 或驱动异常统一脱敏，不把数据库内容暴露给协议调用方。
 parentPort?.on('message', (request: RpcRequest) => {
   const response: RpcResponse = { requestId: request.requestId };
   try {

@@ -12,6 +12,10 @@ import { connectorDocument, SettingsService } from '../../application/settings-s
 import { RecoveryAdminService } from '../../application/recovery-admin-service.js';
 import { absolutePath, text } from '../../domain/schemas.js';
 
+/**
+ * 本地可信入口的命令分发：下划线命令处理身份、文件和恢复管理，其余复用公开操作实现。
+ * presentationAuthorized 必须来自存活的 CLI 附着连接，不能由命令参数自行声明。
+ */
 export async function adminCommand(
   app: Container,
   name: string,
@@ -82,6 +86,7 @@ export async function adminCommand(
       return { valid: true, documentId: document.documentId, revision: document.revision };
     if (document.kind === 'connector')
       return new SettingsService(app.store, app.dataDir).apply(document);
+    // 可编辑文档允许替换配置内容，但来源身份不可借导入文件悄悄改绑。
     const { origin, ...value } = document.value;
     const original = await app.configs.get(document.documentId);
     if (JSON.stringify(origin) !== JSON.stringify(original.config.origin))
@@ -98,6 +103,7 @@ export async function adminCommand(
       idempotencyKey: z.string().optional().parse(args.idempotencyKey) ?? id('cli'),
     });
   }
+  // 编辑器操作临时副本，只有后续 apply 通过 Schema 与修订检查才改变数据库事实。
   if (name === '_config_edit') {
     const configId = z.string().parse(args.configId);
     const settings = new SettingsService(app.store, app.dataDir);
@@ -137,6 +143,7 @@ export async function adminCommand(
     await app.interactions.get(ctx, interactionId, true);
     return { presentationReceipt: app.interactions.receipt(ctx, interactionId, args.response) };
   }
+  // 给当前 IPC 响应留出返回时间，再触发关闭；否则 CLI 可能只能观察到连接被截断。
   if (name === '_stop') {
     setTimeout(() => {
       void app.close();

@@ -20,6 +20,7 @@ import { requireCapability } from '../../infrastructure/acp/capability-gate.js';
 import { resolveEnvironment } from '../../infrastructure/platform/environment.js';
 import { which } from '../../infrastructure/platform/process-host.js';
 
+/** CLI 与 MCP 共用的操作契约；入口注解只描述行为，不能替代应用服务中的权限检查。 */
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -27,9 +28,11 @@ export interface ToolDefinition {
   readOnly: boolean;
   destructive: boolean;
   openWorld?: boolean;
+  /** 管理分类入口解包后返回真实操作，使执行后的权限复核使用原方法与原参数。 */
   resolveOperation?: (input: unknown) => { definition: ToolDefinition; input: unknown };
   run: (ctx: Context, input: unknown) => Promise<unknown>;
 }
+
 const target = z.union([z.strictObject({ runtimeId: text }), z.strictObject({ sessionId: text })]);
 const runtimeGuard = { ...revision, expectedConnectionGeneration: z.number().int().positive() };
 const waitFields = {
@@ -57,6 +60,7 @@ const annotations = z
     lastModified: z.string().optional(),
   })
   .optional();
+/** 保留 ACP 内容块的原生结构；这里校验形状，实际多模态能力由 Runtime 初始化结果限制。 */
 export const promptBlock = z.union([
   z.strictObject({
     type: z.literal('text'),
@@ -118,8 +122,14 @@ const cleanupScope = z.union([
       .optional(),
   }),
 ]);
+
+/**
+ * 建立完整操作目录与输入 Schema；这里只捕获容器引用，构造目录本身不执行业务操作。
+ * CLI 可据此离线生成帮助，MCP 公开范围另由 catalog 中的白名单决定。
+ */
 export function createTools(app: Container): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
+  // 所有入口最终经过同一 Schema.parse，默认值及严格字段限制不会因传输方式变化。
   const add = <S extends z.ZodType>(
     name: string,
     description: string,
@@ -190,6 +200,7 @@ export function createTools(app: Container): ToolDefinition[] {
     },
     true,
   );
+  // 来源查询与刷新分开：搜索使用缓存，显式刷新产生可跟踪的后台操作。
   add(
     'registry_list_sources',
     '列出 Registry 来源与缓存状态。',
@@ -249,6 +260,7 @@ export function createTools(app: Container): ToolDefinition[] {
     (_ctx, args) => app.registry.get(args.sourceId, args.registryAgentId, args.snapshotId),
     true,
   );
+  // 注册配置为共享启动模板；配置可见性不授予任何既有会话的读取或控制权。
   add(
     'agent_list',
     '列出共享注册配置；会话访问仍由归属控制。',
@@ -416,6 +428,7 @@ export function createTools(app: Container): ToolDefinition[] {
     }),
     (ctx, args) => app.local.apply(ctx, args),
   );
+  // 探测 Runtime 用完即关闭，认证与建会话则应显式复用同一个 prepared Runtime。
   add(
     'agent_probe',
     '启动短命探测进程协商能力；认证状态不能跨进程复用。',
@@ -507,6 +520,7 @@ export function createTools(app: Container): ToolDefinition[] {
       );
     },
   );
+  // 互斥的输入分支避免同时指定新配置与已有 Runtime，后者必须携带修订和连接代次。
   add(
     'session_create',
     '创建会话。可消费同一个已认证 Runtime，或按配置准备新 Runtime。',
@@ -567,6 +581,7 @@ export function createTools(app: Container): ToolDefinition[] {
               app.settings.controlTimeoutMs,
               signal,
             );
+            // 下游列表不能自动赋予连接器归属，只返回当前身份已登记可见的下游会话。
             return {
               ...listed,
               sessions: listed.sessions.filter((item) =>
@@ -844,6 +859,7 @@ export function createTools(app: Container): ToolDefinition[] {
     async (ctx, args) => paginate(await app.interactions.list(ctx, args, false), args),
     true,
   );
+  // 真正呈现由传输层执行；普通工具调用不能绕过用户界面直接伪造审阅收据。
   add(
     'interaction_present',
     '通过真实 MCP 或宿主 CLI 呈现交互；需要用户审阅。',
@@ -937,6 +953,7 @@ export function createTools(app: Container): ToolDefinition[] {
   return tools;
 }
 
+/** 统一封装成功/失败与请求 ID，避免不同入口直接泄露第三方异常。 */
 export async function invoke(
   app: Container,
   definitions: ToolDefinition[],

@@ -16,6 +16,7 @@ interface ConnectorMeta {
   cursorKey: string;
   settings: Settings;
 }
+
 export const connectorDocument = z.strictObject({
   schemaVersion: z.literal(1),
   documentId: z.literal('connector'),
@@ -24,11 +25,13 @@ export const connectorDocument = z.strictObject({
   value: settingsSchema,
 });
 
+/** 管理连接器级配置文档；仅导出 settings，不将 serviceId 或游标签名密钥写入编辑文件。 */
 export class SettingsService {
   constructor(
     readonly store: SqliteStore,
     readonly dataDir: string,
   ) {}
+
   async document() {
     const meta = (await this.store.get<ConnectorMeta>('meta', 'connector'))!;
     return {
@@ -39,6 +42,8 @@ export class SettingsService {
       value: meta.settings,
     };
   }
+
+  /** 默认只创建缺失文件，保留已有编辑；显式覆盖时通过临时文件替换。 */
   async export(overwrite = false) {
     const path = join(this.dataDir, 'config/connector.json');
     await mkdir(join(this.dataDir, 'config'), { recursive: true, mode: 0o700 });
@@ -56,6 +61,8 @@ export class SettingsService {
     }
     return { path };
   }
+
+  /** 以文档修订做 CAS 更新；已有容器持有设置快照，因此修改需重启才能生效。 */
   async apply(input: unknown) {
     const doc = connectorDocument.parse(input);
     const meta = (await this.store.get<ConnectorMeta>('meta', 'connector'))!;

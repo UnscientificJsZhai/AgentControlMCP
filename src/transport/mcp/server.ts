@@ -14,6 +14,7 @@ import { digest } from '../../domain/ids.js';
 import { invoke } from './tools.js';
 import { createMcpTools, toolAnnotations } from './catalog.js';
 
+// 重入状态按 Container 保存，支持现代 HTTP 下一次请求创建新 server 后继续同一交互。
 const presentations = new WeakMap<
   Container,
   Map<string, { principalId: string; interactionId: string; revision: number; expires: number }>
@@ -24,6 +25,7 @@ const result = (data: Record<string, unknown>): CallToolResult => ({
   ...(data.ok === false ? { isError: true } : {}),
 });
 
+/** 绑定已认证身份与实际协议代际，注册相同业务工具及按对象授权的大内容资源。 */
 export function createServer(app: Container, identity: Context, transport: McpRequestContext) {
   const server = new McpServer(
     { name: 'agent-control-mcp', version: '1.0.0' },
@@ -34,6 +36,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
   );
   const definitions = createMcpTools(app);
   if (!presentations.has(app)) presentations.set(app, new Map());
+
   async function present(ctx: Context, input: unknown, request: ServerContext) {
     const { interactionId } = z.strictObject({ interactionId: z.string() }).parse(input);
     const record = await app.interactions.get(ctx, interactionId, true);
@@ -44,6 +47,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
     for (const [key, value] of pending) if (value.expires < Date.now()) pending.delete(key);
     const params = record.request;
     let response: unknown;
+    // 现代协议通过 inputRequired 让客户端收集输入，再凭随机令牌重入；不能信任自带答案。
     if (transport.era === 'modern') {
       const token = request.mcpReq.requestState<unknown>();
       if (token !== undefined) {
@@ -77,6 +81,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
         return inputRequired({ inputRequests: { answer: input }, requestState: nonce });
       }
     } else {
+      // 旧协议仅在双向 stdio 连接上反向 elicitation；无状态 HTTP 不能承接此回调。
       if (ctx.mode !== 'stdio')
         fail(
           'INTERACTION_CHANNEL_UNAVAILABLE',
@@ -112,6 +117,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
       action: decision.action,
       ...(decision.content ? { content: decision.content } : {}),
     };
+    // 等待用户输入期间权限可能变化，签发审阅收据前重新检查对象访问与令牌状态。
     await app.interactions.get(ctx, interactionId, true);
     await app.identities.check(ctx);
     return result({
@@ -127,6 +133,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
       },
     });
   }
+
   for (const definition of definitions)
     server.registerTool(
       definition.name,
@@ -153,6 +160,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
         }
       },
     );
+  // 资源 URI 的摘要不是访问凭据，读取复用 content_read 的对象授权与引用校验。
   server.registerResource(
     'content',
     new ResourceTemplate('agent-control://content/{objectId}/{contentId}', { list: undefined }),

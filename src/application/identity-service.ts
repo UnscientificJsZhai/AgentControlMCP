@@ -7,11 +7,14 @@ import { row } from '../infrastructure/storage/sqlite-store.js';
 
 const hash = (salt: string, secret: string) =>
   createHash('sha256').update(salt).update(secret).digest();
+
+/** 将长期身份与可撤销凭据分开管理；共享会话关联身份，令牌轮换不会改变会话归属。 */
 export class IdentityService {
   constructor(
     readonly store: SqliteStore,
     readonly serviceId: string,
   ) {}
+
   async create(name: string) {
     const principal: Principal = {
       id: `auth:${id('principal')}`,
@@ -23,6 +26,8 @@ export class IdentityService {
     await this.store.put('principal', principal);
     return this.issue(principal.id);
   }
+
+  /** 高熵随机令牌仅返回一次，存储带盐哈希；轮换时原凭据撤销与新凭据写入同事务提交。 */
   async issue(principalId: string, rotate = false) {
     const principal = await this.store.get<Principal>('principal', principalId);
     if (!principal?.enabled) fail('OBJECT_NOT_FOUND', '身份不存在或已停用。');
@@ -57,6 +62,7 @@ export class IdentityService {
     });
     return { principalId, credentialId: credential.id, token: `${credential.id}.${secret}` };
   }
+
   async revoke(credentialId: string) {
     const credential = await this.store.get<Credential>('credential', credentialId);
     if (!credential) fail('OBJECT_NOT_FOUND', '令牌记录不存在。');
@@ -68,6 +74,7 @@ export class IdentityService {
     });
     return { revoked: true };
   }
+
   async authenticate(authorization: string | undefined): Promise<Context> {
     const match = /^Bearer ([^.]+)\.([A-Za-z0-9_-]+)$/.exec(authorization ?? '');
     if (!match) fail('UNAUTHENTICATED', '需要有效的 Bearer 令牌。');
@@ -87,6 +94,8 @@ export class IdentityService {
     await this.check(ctx);
     return ctx;
   }
+
+  /** 长轮询和后续调用也需检查凭据有效性，不能只信任请求进入时缓存的认证结果。 */
   async check(ctx: Context) {
     if (ctx.admin || !ctx.principalId.startsWith('auth:')) return;
     const principal = await this.store.get<Principal>('principal', ctx.principalId);
@@ -101,6 +110,8 @@ export class IdentityService {
     )
       fail('UNAUTHENTICATED', '当前访问身份或令牌已失效。');
   }
+
+  /** 匿名身份按服务隔离，仅供允许匿名访问的本地 HTTP 入口使用；clientId 本身不是凭据。 */
   async registerAnonymous(clientId: string) {
     if (!/^[\w.-]{1,128}$/.test(clientId))
       fail('CONFIG_INVALID', '需要 1～128 字符的稳定客户端标识。');

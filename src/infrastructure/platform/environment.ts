@@ -17,6 +17,8 @@ const windows = [
   'TEMP',
   'TMP',
 ];
+
+/** 解析最小 KEY=VALUE 格式，只去掉成对引号；不执行 shell、不展开变量或转义表达式。 */
 export function parseEnvFile(source: string): Record<string, string> {
   const values: Record<string, string> = {};
   for (const line of source.split(/\r?\n/)) {
@@ -35,6 +37,8 @@ export function parseEnvFile(source: string): Record<string, string> {
   }
   return values;
 }
+
+/** 延迟解析环境引用，私有文件限制体积及 POSIX 权限；失败错误不包含实际值。 */
 export async function resolveValue(
   ref: EnvValue,
   host: NodeJS.ProcessEnv = process.env,
@@ -62,6 +66,11 @@ export async function resolveValue(
     });
   }
 }
+
+/**
+ * 仅继承平台基础变量与显式允许项，再按分发默认值、注册配置的顺序覆盖。
+ * Windows 环境键统一大写；引用值及显式继承值加入脱敏集合，literal 视为显式配置数据。
+ */
 export async function resolveEnvironment(
   config: Environment,
   defaults: Record<string, string> = {},
@@ -89,6 +98,8 @@ export async function resolveEnvironment(
   }
   return { env, secrets };
 }
+
+/** 对可 JSON 序列化的数据按已知秘密原值脱敏，先替换长值以避免短值破坏长值匹配。 */
 export function redact<T>(value: T, secrets: string[]): T {
   let serialized = JSON.stringify(value);
   for (const secret of secrets.filter(Boolean).sort((a, b) => b.length - a.length))

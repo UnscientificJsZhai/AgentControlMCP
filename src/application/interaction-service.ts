@@ -23,6 +23,11 @@ import { idem, Serial } from './common.js';
 
 export type PermissionDecision =
   { kind: 'acp_option'; optionId: string } | { kind: 'cancel' } | { kind: 'host'; allow: boolean };
+
+/**
+ * 将下游权限请求及表单交互转为可查询的持久化记录，同时在原连接上等待答复。
+ * 决策先落盘再交付，实例退出或连接代次变化后不能把旧答复发送给新连接。
+ */
 export class InteractionService {
   private readonly pending = new Map<
     string,
@@ -33,11 +38,13 @@ export class InteractionService {
     { interactionId: string; principalId: string; digest: string }
   >();
   private readonly serial = new Serial();
+
   constructor(
     readonly store: SqliteStore,
     readonly runtimes: RuntimeService,
     readonly tasks: TaskService,
   ) {}
+
   async get(ctx: Context, interactionId: string, control = false) {
     const record = await this.store.get<InteractionRecord>('interaction', interactionId);
     if (!record) return fail('OBJECT_NOT_FOUND', '交互不存在。');
@@ -48,6 +55,7 @@ export class InteractionService {
     } else await this.runtimes.get(ctx, record.runtimeId, control);
     return record;
   }
+
   async list(
     ctx: Context,
     filter: {
@@ -78,6 +86,8 @@ export class InteractionService {
     }
     return items;
   }
+
+  /** 路径必须可解析且位于授权工作区；规则的空 roots 在这里展开为会话工作目录集合。 */
   private async policy(runtimeId: string, description: OperationDescription | null) {
     const runtime = await this.store.get<RuntimeRecord>('runtime', runtimeId);
     const handle = this.runtimes.live.get(runtimeId);
@@ -106,6 +116,8 @@ export class InteractionService {
       (ruleRoots.length ? ruleRoots : roots).some((root) => inside(root, path)),
     );
   }
+
+  /** 只从明确的 read 类型和路径推导自动授权；其他描述保留原始 ACP 选项交给用户。 */
   async permission(
     runtimeId: string,
     request: RequestPermissionRequest,
@@ -125,6 +137,7 @@ export class InteractionService {
     if (option) return { outcome: { outcome: 'selected', optionId: option.optionId } };
     return this.open(runtimeId, 'permission', request, signal, requestId);
   }
+
   async host(runtimeId: string, description: OperationDescription, signal: AbortSignal) {
     const policy = await this.policy(runtimeId, description);
     if (policy === 'allow_once') return;
@@ -138,6 +151,8 @@ export class InteractionService {
     )) as { allow: boolean };
     if (!result.allow) fail('ACCESS_DENIED', '宿主操作未获批准。');
   }
+
+  /** 保存脱敏请求并挂起回调；同时限制待处理数量，取消或超时均按拒绝方向收尾。 */
   async open(
     runtimeId: string,
     type: InteractionRecord['type'],
@@ -214,6 +229,7 @@ export class InteractionService {
       signal.removeEventListener('abort', abort);
     }
   }
+
   async end(interactionId: string, state: 'cancelled' | 'expired') {
     return this.serial.run(interactionId, async () => {
       const record = await this.store.get<InteractionRecord>('interaction', interactionId);
@@ -230,12 +246,15 @@ export class InteractionService {
       await this.resume(record);
     });
   }
+
   private deliver(record: InteractionRecord, result: unknown) {
     const pending = this.pending.get(record.id);
     clearTimeout(pending?.timer);
     this.pending.delete(record.id);
     pending?.resolve(result);
   }
+
+  /** 同一 Runtime 的待处理交互全部结束后，才将关联任务或操作恢复为 running。 */
   private async resume(record: InteractionRecord) {
     const remaining = (await this.store.list<InteractionRecord>('interaction')).some(
       (item) => item.runtimeId === record.runtimeId && item.state === 'pending',
@@ -247,6 +266,7 @@ export class InteractionService {
     } else if (!remaining && record.operationId)
       await this.runtimes.operations.update(record.operationId, { state: 'running' });
   }
+
   async respondPermission(
     ctx: Context,
     args: {
@@ -274,6 +294,8 @@ export class InteractionService {
     } else fail('INVALID_PERMISSION_OPTION', '答复类型与交互不匹配。');
     return this.respond(ctx, record, args, response, 'permission_respond');
   }
+
+  /** 由真实交互通道签发一次性审阅收据，绑定身份、交互和完整响应内容。 */
   receipt(ctx: Context, interactionId: string, response: unknown) {
     const token = randomBytes(32).toString('base64url');
     this.receipts.set(token, {
@@ -283,6 +305,7 @@ export class InteractionService {
     });
     return token;
   }
+
   async respondInteraction(
     ctx: Context,
     args: {
@@ -312,6 +335,8 @@ export class InteractionService {
     } else if (args.content) fail('CONFIG_INVALID', '拒绝或取消不能提交表单内容。');
     return this.respond(ctx, record, args, response, 'interaction_respond');
   }
+
+  /** 在串行区内重新授权并检查收据，避免并发答复重复消费或权限撤销后仍提交决策。 */
   private async respond(
     ctx: Context,
     initial: InteractionRecord,
@@ -371,12 +396,15 @@ export class InteractionService {
         ],
         idempotency: idem(ctx, method, args, { interactionId: record.id, state: 'decided' }),
       });
+      // 提交成功后才消费收据并唤醒原请求；写入连接的完成状态由 responded 单独记录。
       if (args.presentationReceipt) this.receipts.delete(args.presentationReceipt);
       this.deliver(record, response);
       await this.resume(record);
       return { interactionId: record.id, state: 'decided' };
     });
   }
+
+  /** 仅由 ACP 输出流确认响应写入后调用；这不表示下游已完成获准的实际操作。 */
   async responded(runtimeId: string, requestId: string | number | null) {
     for (const record of await this.store.list<InteractionRecord>('interaction'))
       if (
@@ -390,6 +418,7 @@ export class InteractionService {
           revision: record.revision + 1,
         });
   }
+
   async complete(runtimeId: string, elicitationId: string) {
     for (const record of await this.store.list<InteractionRecord>('interaction'))
       if (
@@ -403,6 +432,7 @@ export class InteractionService {
           revision: record.revision + 1,
         });
   }
+
   async cancel(runtimeId: string, taskId?: string) {
     for (const record of await this.store.list<InteractionRecord>('interaction'))
       if (

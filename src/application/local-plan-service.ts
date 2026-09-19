@@ -12,6 +12,7 @@ import { idem } from './common.js';
 type Target =
   | { kind: 'new'; config: Omit<AgentConfig, 'origin' | 'launch'> }
   | { kind: 'existing'; configId: string; expectedRevision: number };
+
 interface Plan {
   id: string;
   revision: number;
@@ -28,14 +29,19 @@ interface Plan {
   planDigest: string;
   expiresAt: string;
 }
+
+/** 为复用宿主 Codex 生成可审阅方案，明确绑定程序指纹、Adapter 快照及配置变更。 */
 export class LocalPlanService {
   constructor(readonly installations: InstallationService) {}
+
   async scan(paths?: string[]) {
     const candidates = await scanCodex(paths);
     for (const candidate of candidates)
       await this.installations.store.put('local_candidate', candidate);
     return { candidates };
   }
+
+  /** 只准备目标配置；pending_installation 在 apply 安装成功后才替换为真实安装 ID。 */
   async plan(
     ctx: Context,
     args: {
@@ -111,6 +117,8 @@ export class LocalPlanService {
       adapter: entry,
     };
   }
+
+  /** 验证方案归属、摘要和兼容性确认后执行安装，再以事务提交本地绑定和配置切换。 */
   async apply(
     ctx: Context,
     args: {
@@ -153,6 +161,7 @@ export class LocalPlanService {
           signal,
         );
         signal.throwIfAborted();
+        // 安装可能耗时较长，提交前再次检查本地文件，避免使用确认后已经变化的候选。
         if ((await fingerprint(plan.candidate.path)) !== plan.candidate.fingerprint)
           fail('PLAN_CHANGED', '安装期间本地文件变化。');
         const store = this.installations.store;

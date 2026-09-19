@@ -9,6 +9,8 @@ const evidence = new Socket({ fd: 4, readable: false, writable: true });
 evidence.on('error', () => close());
 let child: ChildProcessWithoutNullStreams | undefined;
 let closing = false;
+
+/** POSIX 以负 PID 终止进程组；Windows 由原生宿主的 Job Object 保证后代进程回收。 */
 function kill(signal: NodeJS.Signals) {
   if (!child?.pid) return;
   try {
@@ -18,6 +20,7 @@ function kill(signal: NodeJS.Signals) {
     /* 进程树已经退出。 */
   }
 }
+
 function close() {
   if (closing) return;
   closing = true;
@@ -26,6 +29,7 @@ function close() {
   setTimeout(() => kill('SIGKILL'), 1000);
   setTimeout(() => process.exit(0), 1500);
 }
+
 let input = '';
 control.on('data', (chunk) => {
   input += chunk.toString('utf8');
@@ -45,6 +49,7 @@ control.on('data', (chunk) => {
     process.platform === 'win32'
       ? ['--parent', String(process.pid), config.executable, ...config.args]
       : config.args;
+  // POSIX 下创建独立进程组，确保向下游树发信号时不会终止连接器自身。
   child = spawn(command, args, {
     cwd: config.cwd,
     env: process.env,

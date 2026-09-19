@@ -13,6 +13,11 @@ export const row = <T extends Entity>(kind: string, entity: T) => ({
   revision: entity.revision,
   data: entity,
 });
+
+/**
+ * 将同步 SQLite 操作隔离到 Worker，主线程通过请求编号等待结果，不直接持有数据库句柄。
+ * Worker 退出后拒绝所有在途及后续调用，避免业务 Promise 永久挂起。
+ */
 export class SqliteStore {
   private readonly worker: Worker;
   private sequence = 0;
@@ -21,6 +26,7 @@ export class SqliteStore {
     number,
     { resolve: (value: unknown) => void; reject: (reason: unknown) => void }
   >();
+
   private constructor(path: string) {
     this.worker = new Worker(new URL('./worker.js', import.meta.url), { workerData: { path } });
     this.worker.on('message', (response: RpcResponse) => {
@@ -41,6 +47,8 @@ export class SqliteStore {
     this.worker.on('error', unavailable);
     this.worker.on('exit', unavailable);
   }
+
+  /** 首次读取充当就绪屏障，确认 Worker 已建库后再收紧数据库文件权限。 */
   static async open(path: string) {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     const store = new SqliteStore(path);
@@ -48,6 +56,7 @@ export class SqliteStore {
     await chmod(path, 0o600);
     return store;
   }
+
   call<T>(method: string, args: unknown): Promise<T> {
     if (this.unavailable)
       return Promise.reject(new AppError('STORAGE_UNAVAILABLE', '存储 Worker 不可用。'));
@@ -57,21 +66,31 @@ export class SqliteStore {
       this.worker.postMessage({ requestId, method, args });
     });
   }
+
   get<T>(kind: string, id: string) {
     return this.call<T | null>('get', { kind, id });
   }
+
   list<T>(kind: string) {
     return this.call<T[]>('list', { kind });
   }
+
   claim(key: string) {
     return this.call<string | null>('claim', { key });
   }
+
   replay<T>(input: { principal: string; method: string; key: string; digest: string }) {
     return this.call<T | null>('replay', input);
   }
+
   commit(input: Transaction) {
     return this.call<CommitResult>('commit', input);
   }
+
+  /**
+   * 通过持久化 claim 协调数据库事务以外的文件操作，最多等待三十秒取得锁。
+   * 仅 ESRCH 能证明原持有进程不存在；权限不足等探测失败不能作为抢占依据。
+   */
   async locked<T>(key: string, action: () => Promise<T>): Promise<T> {
     const holder = `${process.pid}:${id('lock')}`;
     const deadline = Date.now() + 30_000;
@@ -104,9 +123,12 @@ export class SqliteStore {
       await this.commit({ releases: [{ key, holder }] });
     }
   }
+
+  /** 无条件写入便捷入口；需要防止覆盖并发修改时，调用 commit 并显式提供 checks。 */
   async put<T extends Entity>(kind: string, entity: T) {
     await this.commit({ puts: [row(kind, entity)] });
   }
+
   appendEvent(args: {
     streamId: string;
     taskId?: string;
@@ -118,6 +140,7 @@ export class SqliteStore {
   }) {
     return this.call<string>('eventAppend', args);
   }
+
   readEvents(args: {
     streamId: string;
     after: string;
@@ -132,6 +155,7 @@ export class SqliteStore {
       highWatermark: string;
     }>('eventRead', args);
   }
+
   async close() {
     await this.call('close', {});
     await this.worker.terminate();

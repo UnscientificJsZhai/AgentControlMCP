@@ -12,6 +12,7 @@ import type { ConfigService } from './config-service.js';
 import type { OperationService } from './operation-service.js';
 import { idem } from './common.js';
 
+/** 同目标的底层安装作业；每个参与者仍有自己的 operation、归属和取消权。 */
 interface Job {
   id: string;
   abort: AbortController;
@@ -20,8 +21,11 @@ interface Job {
   step: string;
   finished: boolean;
 }
+
+/** 合并相同安装目标并协调跨实例安装锁，升级与回退只在产物就绪后切换注册配置。 */
 export class InstallationService {
   private readonly jobs = new Map<string, Job>();
+
   constructor(
     readonly store: SqliteStore,
     readonly registry: RegistryClient,
@@ -30,14 +34,18 @@ export class InstallationService {
     readonly configs: ConfigService,
     readonly maxJobs: number,
   ) {}
+
   list() {
     return this.store.list<InstallationRecord>('installation');
   }
+
   install(ctx: Context, args: InstallTarget & { idempotencyKey: string }) {
     return this.operations.start(ctx, 'agent_install', args, (op, signal) =>
       this.acquire(args, op, signal),
     );
   }
+
+  /** 安装键覆盖来源、快照地址、分发内容、平台及 Node ABI，避免误复用不兼容产物。 */
   async acquire(
     target: InstallTarget,
     operationId: string,
@@ -116,6 +124,7 @@ export class InstallationService {
               await delay(100, undefined, { signal: jobSignal });
             }
           }
+          // 获锁后再检查缓存，等待期间其他实例可能已经完成并发布同目标安装。
           const installed = (await this.list()).find((item) => item.key === key);
           if (installed) return installed;
           const record = await this.installer.install(
@@ -160,10 +169,13 @@ export class InstallationService {
       ]);
     } finally {
       if (abort) signal.removeEventListener('abort', abort);
+      // 一方取消只退出自己的等待；最后一个参与者离开后才中止共享安装。
       job.participants.delete(operationId);
       if (!job.participants.size && !job.finished) job.abort.abort();
     }
   }
+
+  /** 移除与安装共用目标锁，并拒绝删除仍被注册配置或活动 Runtime 引用的产物。 */
   async remove(ctx: Context, args: { installationId: string; idempotencyKey: string }) {
     const replay = await this.store.replay(idem(ctx, 'installation_remove', args, null));
     if (replay) return replay;
@@ -191,6 +203,8 @@ export class InstallationService {
       await this.store.commit({ releases: [{ key: lock, holder }] });
     }
   }
+
+  /** 先准备目标产物，再用配置 CAS 原子提交版本切换；已有 Runtime 继续使用原启动快照。 */
   async switch(
     ctx: Context,
     args: {
@@ -273,6 +287,8 @@ export class InstallationService {
       },
     );
   }
+
+  /** 刷新可用版本信息并保存检查状态，只通知更新，不自动安装或切换现有配置。 */
   async updates(configIds?: string[], force = false, signal?: AbortSignal) {
     const results = [];
     for (const config of await this.configs.list()) {
@@ -317,6 +333,7 @@ export class InstallationService {
     }
     return { items: results };
   }
+
   async close() {
     for (const job of this.jobs.values()) job.abort.abort();
     await Promise.allSettled([...this.jobs.values()].map((job) => job.promise));

@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 export const text = z.string().min(1);
 export const absolutePath = text.refine(isAbsolute, '必须是宿主机绝对路径');
+/** 持久化环境变量的来源声明；宿主变量和文件引用在启动时解析，不提前写入配置明文。 */
 export const envValue = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('literal'), value: z.string() }),
   z.strictObject({ kind: z.literal('host_env'), name: text }),
@@ -47,6 +48,7 @@ export const mcpServer = z.union([
     headers: z.record(text, envValue),
   }),
 ]);
+/** 注册配置使用严格对象校验，拒绝未知字段，避免拼写错误被静默忽略。 */
 export const agentConfig = z.strictObject({
   name: text.max(200),
   description: z.string().optional(),
@@ -58,6 +60,7 @@ export const agentConfig = z.strictObject({
   launch,
   cwd: absolutePath.optional(),
   environment: environment.default({ values: {}, inherit: [] }),
+  // 空 roots 在运行时按授权工作目录展开；默认自动放行范围仅限可识别的读取操作。
   permissionPolicy: permissionPolicy.default({
     rules: [{ id: 'workspace-read', effect: 'allow_once', operations: ['read'], roots: [] }],
     fallback: 'ask',
@@ -72,6 +75,10 @@ export const agentConfig = z.strictObject({
   mcpServers: z.array(mcpServer).default([]),
   sessionNamespace: text.optional(),
 });
+/**
+ * Patch 中缺省字段表示保持原值，因此移除创建配置时的默认值。
+ * cwd 与 sessionNamespace 额外接受 null，供应用服务显式删除原字段。
+ */
 export const agentPatch = agentConfig
   .omit({ origin: true })
   .extend({
@@ -84,6 +91,7 @@ export const agentPatch = agentConfig
   .partial()
   .extend({ cwd: absolutePath.nullable().optional(), sessionNamespace: text.nullable().optional() })
   .strict();
+/** 实例启动时读取的连接器设置；资源上限同时参与事务准入和后台清理。 */
 export const settingsSchema = z.strictObject({
   maxRuntimes: z.number().int().min(1).max(32).default(8),
   maxGlobalRuntimes: z.number().int().min(1).max(128).default(32),
@@ -124,6 +132,7 @@ export const page = {
   cursor: text.optional(),
   limit: z.number().int().min(1).max(500).default(100),
 };
+/** 写请求的幂等键按调用身份和方法隔离；同一键的参数摘要必须保持一致。 */
 export const write = { idempotencyKey: text.max(128) };
 export const revision = { expectedRevision: z.number().int().positive() };
 export const channel = z.enum(['none', 'mcp_native', 'local_cli']);

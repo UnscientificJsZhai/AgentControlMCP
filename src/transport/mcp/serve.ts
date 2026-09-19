@@ -8,6 +8,7 @@ import type { Container } from '../../bootstrap/container.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import { createServer } from './server.js';
 
+/** stdio 以稳定客户端标识归属数据；输入结束意味着该服务实例结束，需回收下游资源。 */
 export function startStdio(app: Container, clientId: string) {
   if (!/^[\w.-]{1,128}$/.test(clientId)) fail('CONFIG_INVALID', 'stdio 需要稳定客户端标识。');
   const ctx = {
@@ -42,12 +43,15 @@ export interface HttpOptions {
   port: number;
   noAuth?: boolean;
 }
+
 export function validateHttpOptions(options: HttpOptions) {
   if (options.noAuth && !['127.0.0.1', '::1', 'localhost'].includes(options.host))
     fail('CONFIG_INVALID', '无认证 HTTP 只能监听回环地址。');
   if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)
     fail('CONFIG_INVALID', '监听端口无效。');
 }
+
+/** HTTP 容器独立于单次连接存活；每个请求重新认证，共享持久化任务与本实例活动资源。 */
 export async function startHttp(
   app: Container,
   options: HttpOptions,
@@ -61,9 +65,14 @@ export async function startHttp(
       : app.identities.authenticate(headers.get('authorization') ?? undefined);
   const handler = createMcpHandler(
     async (request) => createServer(app, await identity(request.requestInfo!.headers), request),
-    { legacy: 'stateless', maxSubscriptions: 64, onerror: () => {} },
+    {
+      legacy: 'stateless',
+      maxSubscriptions: 64,
+      onerror: () => {},
+    },
   );
   const nodeHandler = toNodeHandler(handler);
+  // 监听通配地址不等于接受任意 Host；显式白名单用于限制非预期主机名访问。
   const allowedHosts = [
     ...new Set([
       'localhost',
@@ -87,6 +96,7 @@ export async function startHttp(
         res.end('Origin is not allowed');
         return;
       }
+      // 在读取请求正文前拒绝无效身份；正文仍按实际接收字节限制，不能只信任请求头。
       if (options.noAuth)
         await app.identities.registerAnonymous(String(req.headers['x-agent-client-id'] ?? ''));
       else await app.identities.authenticate(req.headers.authorization);

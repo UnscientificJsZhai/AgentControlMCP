@@ -7,6 +7,7 @@ import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import { idem, Serial } from './common.js';
 
+/** 为安装、认证、恢复等长操作提供统一的持久化状态、幂等受理和实例内取消句柄。 */
 export class OperationService {
   private readonly active = new Map<string, { abort: AbortController; done: Promise<void> }>();
   readonly serial = new Serial();
@@ -18,16 +19,20 @@ export class OperationService {
       fail('OBJECT_NOT_FOUND', '操作不存在或不可见。');
     return Promise.resolve();
   };
+
   constructor(
     readonly store: SqliteStore,
     readonly instanceId: string,
   ) {}
+
   async get(ctx: Context, operationId: string, control = false) {
     const record = await this.store.get<WorkRecord>('operation', operationId);
     if (!record) return fail('OBJECT_NOT_FOUND', '操作不存在。');
     await this.authorize(ctx, record, control);
     return record;
   }
+
+  /** 先保存受理结果，再异步执行 action；幂等重放只返回原 operation，不启动新工作。 */
   async start(
     ctx: Context,
     type: string,
@@ -87,6 +92,8 @@ export class OperationService {
     void done.catch(() => {});
     return accepted;
   }
+
+  /** 保持终态不可逆，也不允许迟到的 running 更新覆盖 cancelling。 */
   async update(operationId: string, patch: Partial<WorkRecord>) {
     return this.serial.run(operationId, async () => {
       const record = await this.store.get<WorkRecord>('operation', operationId);
@@ -109,6 +116,8 @@ export class OperationService {
       });
     });
   }
+
+  /** 长轮询在状态变化或需要用户交互时返回，每轮及返回前都使用当前权限。 */
   async wait(
     ctx: Context,
     args: {
@@ -133,6 +142,8 @@ export class OperationService {
     await this.authorize(ctx, current, false);
     return { ...current, timedOut: !terminalStates.has(current.state) && Date.now() >= deadline };
   }
+
+  /** 取消仅作用于本调用的 operation；跨过业务提交点后不回滚，合并的安装工作可继续。 */
   async cancel(ctx: Context, operationId: string) {
     return this.serial.run(operationId, async () => {
       const current = await this.get(ctx, operationId, true);
@@ -156,6 +167,7 @@ export class OperationService {
       };
     });
   }
+
   async close() {
     for (const entry of this.active.values()) entry.abort.abort();
     await Promise.allSettled([...this.active.values()].map((item) => item.done));

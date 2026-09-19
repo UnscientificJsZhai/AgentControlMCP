@@ -5,6 +5,7 @@ import type {
 } from '@agentclientprotocol/sdk';
 import { fail } from '../../domain/errors.js';
 
+/** 按初始化响应逐项放行可选方法，load/logout 与会话能力使用不同的声明字段。 */
 export function requireCapability(
   capabilities: AgentCapabilities,
   method: 'load' | 'resume' | 'list' | 'delete' | 'close' | 'logout',
@@ -17,6 +18,8 @@ export function requireCapability(
         : capabilities.sessionCapabilities?.[method] != null;
   if (!supported) fail('CAPABILITY_UNSUPPORTED', `下游未声明 ${method} 能力。`);
 }
+
+/** 发送前拒绝下游未声明的多模态内容，避免把无法解释的输入派发给 Agent。 */
 export function validatePrompt(capabilities: AgentCapabilities, blocks: ContentBlock[]) {
   for (const block of blocks) {
     const supported =
@@ -30,6 +33,8 @@ export function validatePrompt(capabilities: AgentCapabilities, blocks: ContentB
     if (!supported) fail('CAPABILITY_UNSUPPORTED', `下游不支持 ${block.type} 内容。`);
   }
 }
+
+/** 配置项以最新下游声明为准；select 支持分组选项，boolean 必须保留布尔类型。 */
 export function validateOption(
   options: SessionConfigOption[],
   optionId: string,

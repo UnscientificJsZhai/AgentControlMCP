@@ -19,6 +19,8 @@ export interface LocalCandidate {
   compatibility: 'unknown' | 'verified' | 'incompatible';
   evidence: string;
 }
+
+/** 使用真实路径及文件元数据检测候选变化；这不是二进制内容校验或来源可信证明。 */
 export async function fingerprint(path: string) {
   try {
     const actual = await realpath(path);
@@ -39,6 +41,11 @@ export async function fingerprint(path: string) {
     );
   }
 }
+
+/**
+ * 检查显式路径与常见安装位置，按指纹合并符号链接别名，并执行有超时和输出上限的版本探测。
+ * --version 成功只说明程序能启动，不能据此将 Codex/Adapter 组合标记为已验证兼容。
+ */
 export async function scanCodex(paths: string[] = []): Promise<LocalCandidate[]> {
   const names = process.platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex'] : ['codex'];
   const roots = [

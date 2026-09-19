@@ -23,6 +23,8 @@ export interface RuntimeInput {
   cwd?: string | undefined;
   interactionChannel?: string | undefined;
 }
+
+/** 当前进程内的活动资源；包含已解析的秘密，不可整体持久化或返回给外部调用方。 */
 export interface RuntimeHandle {
   client: ClientRuntime;
   spec: LaunchSpec;
@@ -31,8 +33,11 @@ export interface RuntimeHandle {
   operationId?: string;
   sessionId?: string;
 }
+
+/** 管理 ACP 进程从 starting、prepared、bound 到 closed 的生命周期及资源占用。 */
 export class RuntimeService {
   readonly live = new Map<string, RuntimeHandle>();
+  /** 认证、绑定和关闭期间的实例内互斥标记，同时阻止 prepared TTL 清理。 */
   readonly lifecycle = new Set<string>();
   readonly serial = new Serial();
   ports!: (runtimeId: string) => CallbackPorts;
@@ -40,6 +45,7 @@ export class RuntimeService {
     channel === 'none';
   validateBinding: (configId: string, path: string) => Promise<void> = async () => {};
   onClose: (runtimeId: string) => Promise<void> = async () => {};
+
   constructor(
     readonly store: SqliteStore,
     readonly configs: ConfigService,
@@ -47,6 +53,7 @@ export class RuntimeService {
     readonly instanceId: string,
     readonly settings: Settings,
   ) {}
+
   async get(ctx: Context, runtimeId: string, control = false) {
     const record = await this.store.get<RuntimeRecord>('runtime', runtimeId);
     if (!record) return fail('OBJECT_NOT_FOUND', 'Runtime 不存在。');
@@ -58,6 +65,8 @@ export class RuntimeService {
       fail('OBJECT_NOT_FOUND', 'Runtime 不存在或不可见。');
     return record;
   }
+
+  /** 持久化记录不等于可用连接：只能取得本实例实际持有的活动句柄。 */
   handle(record: RuntimeRecord) {
     if (record.instanceId !== this.instanceId)
       fail('INSTANCE_MISMATCH', '请连接 Runtime 所属实例。');
@@ -65,12 +74,15 @@ export class RuntimeService {
     if (!handle || record.state === 'closed') return fail('DOWNSTREAM_EXITED', 'Runtime 已停止。');
     return handle;
   }
+
+  /** 同时校验对象版本和连接代次，拒绝基于旧状态提交的控制请求。 */
   guard(record: RuntimeRecord, expectedRevision: number, generation: number) {
     if (record.connectionGeneration !== generation)
       fail('RUNTIME_GENERATION_CONFLICT', 'ACP 连接代次已变化。');
     if (record.revision !== expectedRevision)
       fail('REVISION_CONFLICT', 'Runtime 修订已变化。', { currentRevision: record.revision });
   }
+
   async update(runtimeId: string, patch: Partial<RuntimeRecord>) {
     return this.serial.run(runtimeId, async () => {
       const old = await this.store.get<RuntimeRecord>('runtime', runtimeId);
@@ -83,11 +95,17 @@ export class RuntimeService {
       return record;
     });
   }
+
   prepare(ctx: Context, args: RuntimeInput & { idempotencyKey: string }) {
     return this.operations.start(ctx, 'runtime_prepare', args, async (op, signal) =>
       this.view(await this.prepareNow(ctx, args, op, signal)),
     );
   }
+
+  /**
+   * 固定配置版本和真实工作目录，在启动进程前原子占用配置、安装与容量名额。
+   * prepared Runtime 可先完成认证再绑定会话，避免认证状态随另建进程丢失。
+   */
   async prepareNow(
     ctx: Context,
     args: RuntimeInput,
@@ -132,6 +150,7 @@ export class RuntimeService {
       instanceId: this.instanceId,
       scope: 'global',
     };
+    // 检查配置仍有效与占用容量必须同事务完成，不能先计数再异步启动。
     await this.store.commit({
       checks: [
         {
@@ -188,6 +207,7 @@ export class RuntimeService {
         cwd,
         env: resolved.env,
       };
+      // 只声明已启用且当前入口真正能完成的宿主能力，尤其是交互和终端认证。
       const capabilities: ClientCapabilities = {
         fs: {
           readTextFile: this.settings.fileCallbacks,
@@ -223,6 +243,7 @@ export class RuntimeService {
       throw error;
     }
   }
+
   view(record: RuntimeRecord) {
     return {
       ...record,
@@ -232,6 +253,8 @@ export class RuntimeService {
       launchSnapshot: record.snapshot,
     };
   }
+
+  /** 先移除活动句柄并终止进程，再通知关联服务收尾；关闭记录保留供诊断和恢复。 */
   async closeNow(runtimeId: string) {
     const handle = this.live.get(runtimeId);
     this.live.delete(runtimeId);
@@ -263,6 +286,8 @@ export class RuntimeService {
       ],
     });
   }
+
+  /** 仅回收本实例中空闲的 prepared Runtime，认证或绑定中的对象不按 TTL 强行关闭。 */
   async expire() {
     for (const record of await this.store.list<RuntimeRecord>('runtime'))
       if (
@@ -273,6 +298,7 @@ export class RuntimeService {
       )
         await this.closeNow(record.id);
   }
+
   async close() {
     await Promise.allSettled([...this.live.keys()].map((runtimeId) => this.closeNow(runtimeId)));
   }

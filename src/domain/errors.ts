@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+/** 可跨 CLI、MCP 和管理 IPC 返回的业务错误；details 必须由调用方确保不含敏感值。 */
 export class AppError extends Error {
   constructor(
     readonly code: string,
@@ -16,6 +17,7 @@ export function fail(code: string, message: string, details: Record<string, unkn
   throw new AppError(code, message, details);
 }
 
+/** 将业务错误、输入校验错误和未知异常转换为稳定的对外结构，不自动建议重试副作用。 */
 export function errorDetail(error: unknown) {
   if (error instanceof AppError) {
     return {

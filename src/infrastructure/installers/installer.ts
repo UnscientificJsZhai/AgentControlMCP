@@ -9,8 +9,10 @@ import { fetchBytes, validateUrl } from '../registry/client.js';
 import { resolveEnvironment } from '../platform/environment.js';
 import { runCommand, which } from '../platform/process-host.js';
 
+/** 将 Node 的平台和架构名称映射为 Registry 分发清单使用的键。 */
 export const platformKey = () =>
   `${process.platform === 'win32' ? 'windows' : process.platform}-${process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'x86_64' : process.arch}`;
+
 export interface InstallTarget {
   sourceId: string;
   registryAgentId: string;
@@ -18,11 +20,15 @@ export interface InstallTarget {
   distribution: 'binary' | 'npx' | 'uvx';
   snapshotId?: string | undefined;
 }
+
+/** 负责下载、展开和包运行器准备；安装去重、锁与配置切换由应用层协调。 */
 export class Installer {
   constructor(
     readonly dataDir: string,
     readonly allowInsecure: boolean,
   ) {}
+
+  /** 将包版本表达式解析为具体版本，拒绝任意 URL/本地路径形式的包来源。 */
   async resolve(target: InstallTarget, manifest: Distribution, signal: AbortSignal) {
     if (target.distribution === 'binary') return target.targetVersion;
     const spec = manifest.package;
@@ -62,6 +68,11 @@ export class Installer {
     const data = JSON.parse(fetched.bytes.toString()) as { info: { version: string } };
     return data.info.version;
   }
+
+  /**
+   * 在独立 staging 目录构建安装描述，完成校验后用 rename 发布安装目录。
+   * 包缓存按安装键隔离；记录中的 ready 只是待提交值，调用方在成功返回后才写入数据库。
+   */
   async install(
     target: InstallTarget,
     manifest: Distribution,
@@ -125,6 +136,7 @@ export class Installer {
         } finally {
           await file.close();
         }
+        // 有声明摘要时必须匹配；没有摘要明确记录 not_provided，不能宣称已校验来源完整性。
         const actual = hash.digest('hex');
         if (manifest.sha256 && actual !== manifest.sha256.toLowerCase())
           fail('INTEGRITY_MISMATCH', 'SHA-256 校验失败，拒绝安装。');
@@ -192,6 +204,7 @@ export class Installer {
           const executable = archivePath(bin, join(cache, 'node_modules', packageName));
           await chmod(executable, 0o700);
           record.executable = await which('npx');
+          // 运行阶段固定版本并离线使用已准备的缓存，避免启动 Agent 时重新解析或下载新版。
           record.prefixArgs = [
             '--offline',
             '--yes',
@@ -207,6 +220,7 @@ export class Installer {
           const match = /^([\w.-]+)(\[[\w,.-]+\])?(?:==.*)?$/.exec(manifest.package!)!;
           const packageName = match[1]!;
           const pinned = `${packageName}${match[2] ?? ''}==${resolvedVersion}`;
+          // uvx 只能使用宿主已有 Python；安装 Adapter 不顺带下载或管理 Python 运行时。
           const toolEnv = {
             ...env,
             UV_CACHE_DIR: join(cache, 'cache'),
@@ -255,6 +269,7 @@ export class Installer {
         mode: 0o600,
         flush: true,
       });
+      // 只有完整安装目录可见后才报告 ready；失败分支只移除本次 staging。
       await rename(staging, path);
       await progress('ready');
       return record;

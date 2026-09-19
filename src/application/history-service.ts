@@ -30,6 +30,7 @@ export type CleanupScope =
         | undefined;
     };
 type HistoryItem = (WorkRecord | SegmentRecord) & { purged?: boolean };
+
 interface Candidate {
   kind: 'task' | 'operation' | 'segment';
   id: string;
@@ -38,6 +39,7 @@ interface Candidate {
   bytes: number;
   endedAt: string;
 }
+
 interface CleanupPlan {
   id: string;
   revision: number;
@@ -48,15 +50,19 @@ interface CleanupPlan {
   candidates: Candidate[];
   scope: CleanupScope;
 }
+
+/** 按当前对象归属查询历史，并通过带版本和摘要的清理方案回收已结束且无活动引用的数据。 */
 export class HistoryService {
   constructor(
     readonly events: EventService,
     readonly operations: OperationService,
     readonly runtimes: RuntimeService,
   ) {}
+
   private get store() {
     return this.events.store;
   }
+
   private async authorized(
     ctx: Context,
     kind: Candidate['kind'],
@@ -73,6 +79,7 @@ export class HistoryService {
     if (!session) return fail('OBJECT_NOT_FOUND', '历史对象不存在。');
     access(ctx, session, owner ? 'owner' : 'read');
   }
+
   async list(
     ctx: Context,
     args: {
@@ -106,6 +113,7 @@ export class HistoryService {
     }
     return items;
   }
+
   async get(ctx: Context, kind: 'task' | 'operation' | 'session_event_segment', objectId: string) {
     const key = kind === 'session_event_segment' ? 'segment' : kind;
     const item = await this.store.get<HistoryItem>(key, objectId);
@@ -114,6 +122,8 @@ export class HistoryService {
     if (item.purged) return { id: item.id, purged: true, error: 'RESULT_PURGED' };
     return item;
   }
+
+  /** 任务和操作须已终结；事件段还需封口，且所属会话无任务、交互或生命周期操作占用。 */
   private async eligible(kind: Candidate['kind'], item: HistoryItem): Promise<boolean> {
     if (item.purged) return false;
     if (kind !== 'segment') return terminalStates.has((item as WorkRecord).state);
@@ -141,6 +151,7 @@ export class HistoryService {
       return false;
     return true;
   }
+
   private async estimatedBytes(kind: Candidate['kind'], item: HistoryItem) {
     let size = bytes(item);
     if (kind === 'segment') size += (item as SegmentRecord).bytes;
@@ -168,6 +179,11 @@ export class HistoryService {
       if (contents.delete(ref.contentId)) size += ref.bytes;
     return size;
   }
+
+  /**
+   * 普通查询只统计调用方可见对象；directory 提供全目录聚合统计，不返回对象明细。
+   * 逻辑容量含去重后的内容文件，物理容量另计 SQLite/WAL 等实际文件占用。
+   */
   async usage(ctx: Context, directory = false) {
     const categories: Record<
       string,
@@ -250,6 +266,8 @@ export class HistoryService {
       maxBytes: this.runtimes.settings.historyMaxBytes,
     };
   }
+
+  /** 只生成预览，按结束时间优先选择旧数据；候选修订一起参与摘要以供 apply 复核。 */
   async plan(
     ctx: Context,
     args: {
@@ -343,6 +361,8 @@ export class HistoryService {
       dryRun: true,
     };
   }
+
+  /** 应用前重新检查归属、修订和活动引用，预览后发生变化的对象必须重新生成方案。 */
   async apply(ctx: Context, cleanupPlanId: string, planDigest: string) {
     const plan = await this.store.get<CleanupPlan>('cleanup_plan', cleanupPlanId);
     if (!plan || plan.ownerId !== ctx.principalId) fail('OBJECT_NOT_FOUND', '清理方案不存在。');
@@ -380,6 +400,7 @@ export class HistoryService {
       segmentIds,
       checks,
     });
+    // 先把事件变为可追踪的墓碑，再解除清理单元的内容引用；其他对象仍引用的文件要保留。
     const deleted = new Set(plan.candidates.map((candidate) => candidate.id));
     const contentIds = new Set(
       (await this.store.list<{ unitId: string; contentId: string }>('content_unit'))
@@ -438,6 +459,8 @@ export class HistoryService {
       dryRun: false,
     };
   }
+
+  /** 先执行时间保留策略，再为超出逻辑容量的部分选择最旧候选；两者复用同一清理校验。 */
   async retain(ctx: Context) {
     const plan = await this.plan(ctx, {
       endedBefore: new Date(

@@ -9,12 +9,16 @@ import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import { idem, Serial } from './common.js';
 
+/** 以数据库为配置事实来源，保留不可变修订快照，并维护供本地编辑的 JSON 投影。 */
 export class ConfigService {
   private readonly serial = new Serial();
+
   constructor(
     readonly store: SqliteStore,
     readonly dataDir: string,
   ) {}
+
+  /** 显式版本读取历史快照，省略版本读取当前配置；运行中的 Runtime 使用自己的快照。 */
   async get(configId: string, revision?: number): Promise<ConfigRecord> {
     const record = await this.store.get<ConfigRecord>(
       revision ? 'config_revision' : 'config',
@@ -23,9 +27,11 @@ export class ConfigService {
     if (!record) return fail('OBJECT_NOT_FOUND', '注册配置不存在。');
     return record;
   }
+
   list() {
     return this.store.list<ConfigRecord>('config');
   }
+
   private async validate(config: AgentConfig) {
     if (config.launch.kind === 'installation') {
       const install = await this.store.get<InstallationRecord>(
@@ -41,6 +47,7 @@ export class ConfigService {
       )
         fail('CONFIG_INVALID', '下游不能递归挂载连接器自身。');
   }
+
   async register(ctx: Context, args: { config: AgentConfig; idempotencyKey: string }) {
     const config = agentConfig.parse(args.config);
     await this.validate(config);
@@ -66,6 +73,8 @@ export class ConfigService {
     const projection = !result.replayed ? await this.project(record) : {};
     return { ...(result.response as typeof response), ...projection };
   }
+
+  /** 合并顶层 Patch 后整体校验，原子切换安装引用；可同时记录版本切换操作的提交点。 */
   async update(
     ctx: Context,
     args: { configId: string; patch: AgentPatch; expectedRevision: number; idempotencyKey: string },
@@ -134,6 +143,8 @@ export class ConfigService {
     const projection = !result.replayed ? await this.project(record) : {};
     return { ...(result.response as typeof response), ...projection };
   }
+
+  /** 仅移除当前注册项；存在活动 Runtime 时拒绝，历史修订保留供审计和显式恢复使用。 */
   async remove(
     ctx: Context,
     args: { configId: string; expectedRevision: number; idempotencyKey: string },
@@ -158,6 +169,7 @@ export class ConfigService {
     });
     return result.response;
   }
+
   document(record: ConfigRecord) {
     return {
       schemaVersion: 1,
@@ -167,6 +179,11 @@ export class ConfigService {
       value: record.config,
     };
   }
+
+  /**
+   * 导出失败不撤销已经提交的配置，而是返回 exportPending 供管理入口修复。
+   * 写入前比较上次导出的文件摘要，默认保护用户在磁盘上的手工编辑；force 表示显式覆盖。
+   */
   async project(record: ConfigRecord, force = false) {
     return this.serial.run(record.id, async () => {
       const lock = `projection:${record.id}`;
@@ -187,6 +204,7 @@ export class ConfigService {
         return { applied: true, exportPending: true, warning: 'CONFIG_EXPORT_CONFLICT' };
       }
       try {
+        // 取得跨实例投影锁后重读最新修订，避免慢导出把较旧的配置写回磁盘。
         record = await this.get(record.id);
         const dir = join(this.dataDir, 'config', 'agents');
         await mkdir(dir, { recursive: true, mode: 0o700 });

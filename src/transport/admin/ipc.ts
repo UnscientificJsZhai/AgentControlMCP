@@ -15,6 +15,11 @@ interface Message {
   attach?: boolean;
   presentationSession?: string;
 }
+
+/**
+ * 建立仅供本地 CLI 使用的管理端点，以实例 nonce 验证请求。
+ * 普通连接处理一个命令后关闭；attach 连接保持存活，以连接寿命证明交互通道仍存在。
+ */
 export async function startAdmin(app: Container) {
   const sockets = new Set<Socket>();
   const presentationSessions = new Set<string>();
@@ -45,6 +50,7 @@ export async function startAdmin(app: Container) {
         const expected = Buffer.from(app.instance.nonce);
         if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
           throw new AppError('UNAUTHENTICATED', '管理端点凭证无效。');
+        // 附着凭证只存在于当前实例内存中，关闭附着连接后不能再据此签发审阅收据。
         if (message.attach) {
           attached = randomBytes(32).toString('base64url');
           presentationSessions.add(attached);
@@ -80,6 +86,7 @@ export async function startAdmin(app: Container) {
   };
 }
 
+/** 发送一条管理请求；attach 成功后调用方负责持有连接并在交互结束时调用 close。 */
 export function adminRequest(
   instance: InstanceRecord,
   name: string,

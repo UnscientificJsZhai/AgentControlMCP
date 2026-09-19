@@ -32,6 +32,7 @@ export async function which(
     executable: command,
   });
 }
+
 export async function executableCommand(command: string, args: string[], env: NodeJS.ProcessEnv) {
   const executable = await which(command, env);
   if (process.platform !== 'win32' || !/\.cmd$/i.test(executable)) return { executable, args };
@@ -44,12 +45,18 @@ export async function executableCommand(command: string, args: string[], env: No
     args: [join(dirname(executable), 'node_modules/npm/bin', `${match[1]}.js`), ...args],
   };
 }
+
 export interface LaunchSpec {
   executable: string;
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
 }
+
+/**
+ * 通过独立 supervisor 持有下游进程树；连接器意外退出时，控制管道 EOF 仍能触发清理。
+ * stdin/stdout/stderr 留给下游，额外的 fd 3 传启动配置，fd 4 返回进程与退出信息。
+ */
 export class ProcessHost {
   readonly process;
   readonly stdout: Readable;
@@ -62,6 +69,7 @@ export class ProcessHost {
   private readonly control: Writable;
   private readonly startup: Promise<number>;
   private stopped = false;
+
   private constructor(spec: LaunchSpec) {
     this.process = spawn(
       process.execPath,
@@ -109,6 +117,7 @@ export class ProcessHost {
       JSON.stringify({ executable: spec.executable, args: spec.args, cwd: spec.cwd }) + '\n',
     );
   }
+
   static async start(spec: LaunchSpec) {
     const resolved = await executableCommand(spec.executable, spec.args, spec.env);
     const host = new ProcessHost({ ...spec, ...resolved });
@@ -128,6 +137,8 @@ export class ProcessHost {
       clearTimeout(timer);
     }
   }
+
+  /** 关闭控制管道请求监督进程回收整棵树，重复调用等待同一个 close 结果。 */
   async stop() {
     if (!this.stopped) {
       this.stopped = true;
@@ -137,6 +148,8 @@ export class ProcessHost {
     await this.closed;
   }
 }
+
+/** 有界执行探测或安装命令，保留有限 stdout 并排空 stderr；失败不返回原始命令输出。 */
 export async function runCommand(
   spec: LaunchSpec,
   options: { signal?: AbortSignal; timeoutMs?: number; maxBytes?: number } = {},

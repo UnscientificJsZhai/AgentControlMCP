@@ -41,6 +41,8 @@ export interface CreateInput {
   options?: Record<string, string | boolean> | undefined;
   modeId?: string | undefined;
 }
+
+/** 恢复方案固定配置版本和工作目录摘要；apply 必须显式接受且仍在有效期内。 */
 interface RestorePlan {
   id: string;
   revision: number;
@@ -53,9 +55,16 @@ interface RestorePlan {
   environmentDigest: string;
   expiresAt: string;
 }
+
+/**
+ * 管理逻辑会话、下游会话和激活代次的映射，统一协调 prompt、控制请求和生命周期操作。
+ * serial 保护本实例的会话修改，数据库修订检查与租约处理跨实例竞争。
+ */
 export class SessionService {
   readonly serial = new Serial();
   private readonly controls = new Set<string>();
+
+  /** 关闭流程可先接纳再取消 prompt；认证等其他生命周期操作需等待 prompt 结束。 */
   assertLifecycleAvailable(session: SessionRecord | null, runtimeId: string, allowPrompt = false) {
     if (
       this.runtimes.lifecycle.has(runtimeId) ||
@@ -63,24 +72,29 @@ export class SessionService {
     )
       fail('SESSION_BUSY', '需要当前会话控制、认证及 prompt 结束。');
   }
+
   cancelTask: (ctx: Context, taskId: string) => Promise<unknown> = async () => {};
+
   constructor(
     readonly store: SqliteStore,
     readonly runtimes: RuntimeService,
     readonly operations: OperationService,
     readonly events: EventService,
   ) {}
+
   async get(ctx: Context, sessionId: string, level: 'read' | 'control' | 'owner' = 'read') {
     const session = await this.store.get<SessionRecord>('session', sessionId);
     if (!session) return fail('SESSION_NOT_FOUND', '会话不存在。');
     access(ctx, session, level);
     return session;
   }
+
   async list(ctx: Context, configId?: string) {
     return (await this.store.list<SessionRecord>('session')).filter(
       (item) => visible(ctx, item) && (!configId || item.configId === configId),
     );
   }
+
   async view(ctx: Context, sessionId: string) {
     const session = await this.get(ctx, sessionId);
     const runtime = await this.runtimes.get(ctx, session.runtimeId);
@@ -94,6 +108,7 @@ export class SessionService {
       configRevision: runtime.configRevision,
     };
   }
+
   async mutate(sessionId: string, fn: (session: SessionRecord) => SessionRecord) {
     return this.serial.run(sessionId, async () => {
       const session = await this.store.get<SessionRecord>('session', sessionId);
@@ -106,12 +121,15 @@ export class SessionService {
       return next;
     });
   }
+
   async runtime(ctx: Context, sessionId: string) {
     const session = await this.get(ctx, sessionId, 'control');
     if (session.state !== 'ready') fail('DOWNSTREAM_EXITED', '会话当前不可运行，请显式恢复。');
     const record = await this.runtimes.get(ctx, session.runtimeId, true);
     return { session, record, handle: this.runtimes.handle(record) };
   }
+
+  /** 按实际下游能力生成建会话参数；敏感引用在派发前解析并加入该连接的脱敏集合。 */
   async params(
     runtime: RuntimeRecord,
     additionalDirectories: string[],
@@ -161,6 +179,8 @@ export class SessionService {
       mcpServers: servers,
     };
   }
+
+  /** 创建为后台 operation，可使用显式准备并已认证的 Runtime，也可按配置现场准备。 */
   async create(ctx: Context, args: CreateInput) {
     if (args.runtimeId) await this.runtimes.get(ctx, args.runtimeId, true);
     return this.operations.start(
@@ -229,6 +249,7 @@ export class SessionService {
             downstreamSessionId: '',
             startedAt: now(),
           };
+          // 派发 session/new 前先保存 creating/activation，通知回调才能正确归属本次创建。
           await this.store.commit({
             checks: [{ kind: 'runtime', id: runtime.id, revision: runtime.revision }],
             puts: [
@@ -246,6 +267,7 @@ export class SessionService {
             this.runtimes.settings.controlTimeoutMs,
             signal,
           );
+          // 下游 ID 只在所属命名空间内唯一；租约阻止多个 Runtime 同时激活同一会话。
           const lease = `session:${digest([session.namespace, response.sessionId])}`;
           await this.store.commit({
             claims: [{ key: lease, holder: runtime.id }],
@@ -296,6 +318,7 @@ export class SessionService {
             await this.runtimes.closeNow(runtime.id);
             throw error;
           }
+          // 明确的认证错误允许保留原连接；调用方认证后显式再建会话，不自动重发。
           if (error instanceof AppError && error.code === 'AUTH_REQUIRED') {
             const updated = await this.runtimes.update(runtime.id, {
               state: 'prepared',
@@ -313,6 +336,7 @@ export class SessionService {
               authMethods: handle.client.initialize.authMethods,
             });
           }
+          // 其他派发失败可能已经在下游创建会话，不能把 Runtime 当作空闲对象重新使用。
           await this.runtimes.update(runtime.id, { state: 'creation_unknown' });
           if (session)
             await this.mutate(session.id, (current) => ({ ...current, state: 'interrupted' }));
@@ -324,6 +348,8 @@ export class SessionService {
       args.runtimeId ? { runtimeId: args.runtimeId } : {},
     );
   }
+
+  /** 会话 ready、Runtime bound 与 operation 提交点一同落盘，取消与绑定只能有一方胜出。 */
   private async bind(
     sessionId: string,
     runtimeId: string,
@@ -366,6 +392,8 @@ export class SessionService {
       }),
     );
   }
+
+  /** 按会话顺序追加下游通知，并让可查询的配置投影与对应事件在存储层同时更新。 */
   async notification(runtimeId: string, notification: SessionNotification) {
     const sessionId = this.runtimes.live.get(runtimeId)?.sessionId;
     if (!sessionId) return;
@@ -390,6 +418,11 @@ export class SessionService {
       await this.events.append(session, update.sessionUpdate, update, projection);
     });
   }
+
+  /**
+   * 控制请求先登记幂等派发凭据，再调用下游；重复请求只读取已知结果，不重发未知操作。
+   * 网络等待在会话队列外进行，让下游通知可以继续更新投影，也允许 prompt 期间切换模式。
+   */
   private async control(
     ctx: Context,
     args: { sessionId: string; expectedRevision: number; idempotencyKey: string },
@@ -432,6 +465,7 @@ export class SessionService {
     }
     try {
       const patch = await action(session, record);
+      // 请求期间若通知已推进控制版本，优先保留通知的投影，避免旧响应覆盖新状态。
       const next = await this.mutate(session.id, (current) =>
         current.controlVersion === session.controlVersion
           ? { ...current, ...patch, controlVersion: current.controlVersion + 1 }
@@ -449,6 +483,7 @@ export class SessionService {
       this.controls.delete(session.id);
     }
   }
+
   setOption(
     ctx: Context,
     args: {
@@ -475,6 +510,7 @@ export class SessionService {
       return { options: result.configOptions };
     });
   }
+
   setMode(
     ctx: Context,
     args: { sessionId: string; modeId: string; expectedRevision: number; idempotencyKey: string },
@@ -493,6 +529,8 @@ export class SessionService {
       return { modes: { ...session.modes, currentModeId: args.modeId } };
     });
   }
+
+  /** 共享与移交仅作用于同一 HTTP 服务的会话；每次读取仍按最新 grants 重新授权。 */
   async ownership(
     ctx: Context,
     method: 'share' | 'unshare' | 'transfer',
@@ -544,6 +582,8 @@ export class SessionService {
       return result.response;
     });
   }
+
+  /** 优先请求 ACP 关闭；不论协议关闭成功与否，都回收该 Runtime 的宿主资源。 */
   async close(
     ctx: Context,
     args: { sessionId: string; expectedRevision: number; idempotencyKey: string },
@@ -586,6 +626,8 @@ export class SessionService {
       { sessionId: args.sessionId },
     );
   }
+
+  /** Runtime 结束时封口事件段、记录激活终点并释放下游会话租约，保留逻辑会话历史。 */
   async ended(runtimeId: string) {
     for (const session of await this.store.list<SessionRecord>('session'))
       if (session.runtimeId === runtimeId && session.state !== 'deleted') {
@@ -615,6 +657,11 @@ export class SessionService {
         });
       }
   }
+
+  /**
+   * 两阶段恢复：prepare 展示目标运行快照，apply 校验确认摘要后重新激活原下游会话。
+   * 每次恢复产生新 activation；load 产生的历史通知进入独立回放段，不混入新 prompt。
+   */
   async restore(
     ctx: Context,
     method: 'load' | 'resume',

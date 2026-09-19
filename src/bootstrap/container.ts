@@ -42,6 +42,11 @@ export const defaultDataDir = () =>
     : process.platform === 'win32'
       ? join(process.env.LOCALAPPDATA ?? homedir(), 'AgentControlMCP')
       : join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local/share'), 'agent-control-mcp'));
+
+/**
+ * 单个服务实例的装配根：创建应用服务，并把协议回调、权限查询和资源回收连接起来。
+ * 数据库可由多个实例共享，但进程句柄、交互通道和定时器只属于当前实例。
+ */
 export class Container {
   readonly instanceId = id('instance');
   readonly configs;
@@ -64,6 +69,7 @@ export class Container {
   private timer: NodeJS.Timeout | undefined;
   private closing: Promise<void> | undefined;
   onShutdown: () => Promise<void> = async () => {};
+
   private constructor(
     readonly store: SqliteStore,
     readonly dataDir: string,
@@ -119,6 +125,7 @@ export class Container {
       heartbeat: now(),
       state: 'active',
     };
+    // 关联会话的操作跟随会话当前权限，确保共享撤销或所有权移交立即影响后续查询。
     this.operations.authorize = async (ctx, operation, control) => {
       await this.identities.check(ctx);
       if (ctx.admin) return;
@@ -145,6 +152,7 @@ export class Container {
         (this.attachedChannels.has(ctx.principalId) ||
           this.attachedChannels.has(this.admin.principalId))) ||
       (channel === 'mcp_native' && ctx.nativeInteraction === true);
+    // 先解除等待中的回调和终端，再结束任务与会话，最后由 Runtime 服务释放占用。
     this.runtimes.onClose = async (runtimeId) => {
       await this.interactions.cancel(runtimeId);
       await this.terminals.close(runtimeId);
@@ -171,6 +179,8 @@ export class Container {
       },
     });
   }
+
+  /** 打开存储、修复已确认退出的实例，再注册自身；HTTP 单例约束在存储事务中取得。 */
   static async create(
     options: {
       dataDir?: string | undefined;
@@ -197,6 +207,7 @@ export class Container {
           cursorKey: randomBytes(32).toString('hex'),
           settings: settingsSchema.parse(options.settings ?? {}),
         };
+        // 多个入口可以同时首次启动；CAS 失败者读取胜出者的 serviceId 和游标签名密钥。
         try {
           await store.commit({
             checks: [{ kind: 'meta', id: 'connector', absent: true }],
@@ -222,6 +233,7 @@ export class Container {
       });
       await container.registry.initialize();
       await new SettingsService(store, dataDir).export();
+      // 心跳供本地诊断使用，自动恢复另以进程存活检查为准；unref 避免定时器维持进程存活。
       container.timer = setInterval(() => {
         void (async () => {
           const current = await store.get<InstanceRecord>('instance', container.instanceId);
@@ -245,6 +257,11 @@ export class Container {
       throw error;
     }
   }
+
+  /**
+   * 处理 Agent 发起的宿主回调：先确认 Runtime/会话关联，再检查能力、路径和操作权限。
+   * elicitation 可发生在认证阶段，因而允许尚未绑定会话的 Runtime 请求交互。
+   */
   async callback(
     runtimeId: string,
     method: acp.ClientRequestMethod,
@@ -322,6 +339,8 @@ export class Container {
         return this.terminals.release(runtimeId, (params as acp.ReleaseTerminalRequest).terminalId);
     }
   }
+
+  /** 启动前复核已绑定路径的文件元数据指纹；检测到变化时要求重新确认方案。 */
   async validateBinding(configId: string, path: string) {
     const binding = await this.store.get<{ candidate: { path: string; fingerprint: string } }>(
       'local_binding',
@@ -333,10 +352,14 @@ export class Container {
     )
       fail('LOCAL_EXECUTABLE_UNAVAILABLE', '绑定的 Codex 文件已改变，请重新生成方案。');
   }
+
+  /** 多个退出入口共享同一次关闭过程，避免重复释放数据库和实例记录。 */
   close() {
     this.closing ??= this.shutdown();
     return this.closing;
   }
+
+  /** 停止新维护工作，收敛下游任务，再写入实例终态；存储必须最后关闭。 */
   private async shutdown() {
     clearInterval(this.timer);
     for (const task of await this.store.list<WorkRecord>('task'))

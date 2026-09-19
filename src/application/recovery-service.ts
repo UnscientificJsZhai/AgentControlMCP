@@ -14,6 +14,7 @@ import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import type { Row } from '../infrastructure/storage/protocol.js';
 
+/** 只有 ESRCH 视为已退出；权限错误或其他不确定情况按仍存活处理，避免错误抢占资源。 */
 export function isAlive(pid: number) {
   try {
     process.kill(pid, 0);
@@ -22,6 +23,11 @@ export function isAlive(pid: number) {
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
+
+/**
+ * 只修复已确认退出的实例：将未完成工作标为 interrupted，释放占用并封口事件段。
+ * 恢复数据库状态不等于恢复下游执行，不重发 prompt、认证或其他结果未知的操作。
+ */
 export async function recover(store: SqliteStore) {
   const instances = await store.list<InstanceRecord>('instance');
   const dead = instances.filter(
@@ -124,6 +130,7 @@ export async function recover(store: SqliteStore) {
     ))
       if (job.instanceId === instance.id)
         releases.push({ key: `install:${job.key}`, holder: job.id });
+    // 以实例修订防止多个启动者重复接管；该实例的状态与资源释放一起提交。
     await store.commit({
       checks: [{ kind: 'instance', id: instance.id, revision: instance.revision }],
       puts,

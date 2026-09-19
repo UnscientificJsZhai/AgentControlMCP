@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 
 type RpcId = string | number;
+
 interface RpcMessage {
   id?: RpcId;
   method?: string;
@@ -14,10 +15,12 @@ interface RpcMessage {
   result?: unknown;
   error?: { message: string };
 }
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
 }
+
 interface FixtureSession {
   sessionId: string;
   cwd: string;
@@ -27,10 +30,12 @@ function object(value: unknown): Record<string, unknown> {
   assert.ok(typeof value === 'object' && value !== null && !Array.isArray(value), '需要对象');
   return value as Record<string, unknown>;
 }
+
 function string(value: unknown): string {
   assert.ok(typeof value === 'string', '需要字符串');
   return value;
 }
+
 function parseMessage(line: string): RpcMessage {
   const value = object(JSON.parse(line) as unknown);
   assert.ok(
@@ -45,6 +50,7 @@ function parseMessage(line: string): RpcMessage {
 
 // 独立 JSON-RPC 对端：不复用被测连接器的 ACP 客户端或领域实现。
 const input = createInterface({ input: process.stdin });
+// 认证只保存在此进程内，专门验证连接器不能把一个探测进程的登录结论用于另一个进程。
 let authenticated = process.env.FIXTURE_REQUIRE_AUTH !== '1';
 let nextId = 0;
 let option: boolean | string = false;
@@ -60,6 +66,7 @@ const audit = async (message: Record<string, unknown>) => {
 };
 const send = (value: Record<string, unknown>) =>
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
+/** Agent 主动发起回调，与上游请求共享 NDJSON 连接；前缀 ID 避免混淆双向响应。 */
 const callback = (method: string, params: Record<string, unknown>) => {
   void audit({ callback: method });
   return new Promise<unknown>((resolve, reject) => {
@@ -91,11 +98,14 @@ const modes = {
   ],
 };
 const state = () => ({ configOptions: options(), modes });
+
+/** 将最小会话信息写入测试工作目录，让另一 fixture 进程可以验证 load/resume。 */
 async function save(id: string, cwd: string) {
   const value: FixtureSession = { sessionId: id, cwd };
   sessions.set(id, value);
   await writeFile(join(cwd, `.fixture-${id}.json`), JSON.stringify(value));
 }
+
 async function handle(message: RpcMessage) {
   if (!message.method) {
     await audit({ callbackResult: message });
@@ -211,6 +221,7 @@ async function handle(message: RpcMessage) {
     case '$/cancel_request':
       return;
     case 'session/prompt': {
+      // 文本关键词选择确定性的故障/回调场景，可组合测试权限、终端、交互及中断路径。
       const sessionId = string(params.sessionId);
       const abort = new AbortController();
       prompts.set(sessionId, abort);
@@ -221,6 +232,7 @@ async function handle(message: RpcMessage) {
         .map((block) => string(block.text))
         .join('');
       const cwd = sessions.get(sessionId)?.cwd ?? process.cwd();
+      // 孙进程忽略 SIGTERM，用于验证受管进程组（Windows Job）内的后代最终被强制回收。
       if (text.includes('tree')) {
         const child = spawn(
           process.execPath,
@@ -366,6 +378,8 @@ async function handle(message: RpcMessage) {
   }
   if ('id' in message) send({ id: message.id, result });
 }
+
+// 每条请求独立异步处理，使慢 prompt 期间仍能收到取消和模式切换，避免 fixture 串行假象。
 input.on('line', (line) => {
   let message: RpcMessage;
   try {

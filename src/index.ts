@@ -1,3 +1,4 @@
+/** 库入口只导出能力；创建容器、启动服务和安装退出钩子均由调用方显式触发。 */
 export { Container } from './bootstrap/container.js';
 export { createTools, invoke } from './transport/mcp/tools.js';
 export { createMcpTools } from './transport/mcp/catalog.js';

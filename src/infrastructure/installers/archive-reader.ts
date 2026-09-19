@@ -10,6 +10,7 @@ import unbzip2 from 'unbzip2-stream';
 import { fail } from '../../domain/errors.js';
 import { inside } from '../platform/file-callbacks.js';
 
+/** 统一拒绝目录穿越、绝对路径、Windows 设备名和易混淆后缀，产物需在各平台保持安全。 */
 export function archivePath(name: string, root: string) {
   const stripped = name.replace(/^\.\//, '');
   if (
@@ -30,6 +31,11 @@ export function archivePath(name: string, root: string) {
   if (!inside(root, target)) fail('ARCHIVE_UNSAFE', '归档路径越界。');
   return target;
 }
+
+/**
+ * 流式展开 ZIP/TAR，并限制条目数、声明展开大小与压缩比。
+ * 普通文件使用独占创建；链接推迟到所有文件写完后处理，避免后续条目沿链接写到根目录外。
+ */
 export async function extractArchive(
   file: string,
   url: string,
@@ -49,6 +55,7 @@ export async function extractArchive(
     if (count > 100_000 || total > 4 * 1024 ** 3 || total > Math.max(compressedBytes, 1) * 200)
       fail('ARCHIVE_UNSAFE', '归档条目数、展开大小或压缩比超过限制。');
     const target = archivePath(name, root);
+    // 即使当前宿主大小写敏感，也拒绝在其他支持平台上会覆盖彼此的条目。
     const normalized = target.toLowerCase();
     if (seen.has(normalized)) fail('ARCHIVE_UNSAFE', '归档存在重复或大小写冲突路径。');
     seen.add(normalized);
@@ -178,6 +185,7 @@ export async function extractArchive(
       source.destroy();
     }
   }
+  // 同时检查链接声明位置和目标真实路径，覆盖通过另一条符号链接间接逃逸的情况。
   for (const entry of links) {
     if (!inside(root, entry.source) || !inside(root, await realpath(entry.source)))
       fail('ARCHIVE_UNSAFE', '归档链接目标越界。');
@@ -188,6 +196,7 @@ export async function extractArchive(
   await writeFile(join(root, '.extracted'), String(total), { mode: 0o600 });
   return { entries: count, expandedBytes: total };
 }
+
 export async function ensureExecutable(path: string) {
   await chmod(path, 0o700);
 }

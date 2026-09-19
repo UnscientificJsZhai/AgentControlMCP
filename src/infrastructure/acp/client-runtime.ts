@@ -15,6 +15,7 @@ import { ProcessHost } from '../platform/process-host.js';
 import type { LaunchSpec } from '../platform/process-host.js';
 import { redact } from '../platform/environment.js';
 
+/** 显式限制可派发的方法集合，避免把 SDK 新增或实验性能力无意暴露为稳定接口。 */
 export const stableRequests = [
   'initialize',
   'authenticate',
@@ -29,6 +30,8 @@ export const stableRequests = [
   'session/set_config_option',
   'session/prompt',
 ] as const;
+
+/** ACP 适配器只转发协议事件，由装配层注入持久化、授权和宿主资源操作。 */
 export interface CallbackPorts {
   request: (
     method: ClientRequestMethod,
@@ -40,11 +43,14 @@ export interface CallbackPorts {
   responded: (requestId: string | number | null) => Promise<void>;
   exited: () => Promise<void>;
 }
+
+/** 一个子进程对应一条 ACP 连接，负责消息边界、通知顺序、超时和对外结果脱敏。 */
 export class ClientRuntime {
   readonly connection: ClientConnection;
   initialize!: InitializeResponse;
   private notifications: Promise<void> = Promise.resolve();
   private notificationError: unknown;
+
   private constructor(
     readonly host: ProcessHost,
     readonly secrets: string[],
@@ -87,6 +93,7 @@ export class ClientRuntime {
     app.onRequest('elicitation/create', (ctx) =>
       request('elicitation/create', ctx.params, ctx.signal, ctx.requestId),
     );
+    // 顺序持久化通知；通知丢失会破坏任务结果与历史的一致性，因此失败时停止下游。
     const notification = (method: string, params: unknown) => {
       this.notifications = this.notifications
         .then(() => ports.notify(method, redact(params, secrets)))
@@ -100,6 +107,7 @@ export class ClientRuntime {
     app.onNotification('elicitation/complete', (ctx) =>
       notification('elicitation/complete', ctx.params),
     );
+    // NDJSON 的帧边界是换行而不是 stream chunk；跨 chunk 累计以阻止超大单条消息。
     let frameBytes = 0;
     const bounded = new Transform({
       transform(chunk: Buffer, _encoding, callback) {
@@ -126,6 +134,7 @@ export class ClientRuntime {
       readable: stream.readable,
       writable: new WritableStream({
         async write(message) {
+          // 只有底层 writer 接受响应后才记录 responded，不能把已决定等同于已发回。
           await writer.write(message);
           if ('id' in message && ('result' in message || 'error' in message))
             await ports.responded(message.id);
@@ -134,9 +143,11 @@ export class ClientRuntime {
         abort: (reason) => writer.abort(reason),
       }),
     });
+    // 持续排空 stderr 防止子进程背压；不把可能含凭据的原始日志混入协议或结果。
     host.stderr.resume();
     void host.closed.then(() => ports.exited()).catch(() => {});
   }
+
   static async start(
     spec: LaunchSpec,
     secrets: string[],
@@ -165,6 +176,11 @@ export class ClientRuntime {
       throw error;
     }
   }
+
+  /**
+   * 派发后只竞争响应、取消和超时，不自动重试；终止等待无法证明下游没有产生副作用。
+   * 成功返回前等待通知屏障，使当前已排队的 session/update 先完成持久化。
+   */
   async request<M extends AgentRequestMethod>(
     method: M,
     params: AgentRequestParamsByMethod[M],
@@ -216,6 +232,8 @@ export class ClientRuntime {
       signal?.removeEventListener('abort', onAbort);
     }
   }
+
+  /** 等待当前通知队列并传播其失败，供任务终态提交前显式同步。 */
   async barrier() {
     await this.notifications;
     if (this.notificationError)
@@ -223,9 +241,11 @@ export class ClientRuntime {
         ? this.notificationError
         : new AppError('PROTOCOL_ERROR', '通知处理失败。');
   }
+
   cancel(sessionId: string) {
     return this.connection.agent.notify('session/cancel', { sessionId });
   }
+
   async close() {
     this.connection.close();
     await this.host.stop();

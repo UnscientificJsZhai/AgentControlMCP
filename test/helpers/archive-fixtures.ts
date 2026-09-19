@@ -39,6 +39,7 @@ function zip(path: string): Buffer {
   return Buffer.concat([local, name, agent, central, name, end]);
 }
 
+/** 手工构造普通文件及内部符号链接，验证两种 TAR 压缩方式都保留可用链接。 */
 function tar(): Buffer {
   const file = Buffer.alloc(512);
   new Header({ path: 'bin/agent', type: 'File', size: agent.length, mode: 0o755 }).encode(file);
@@ -55,6 +56,7 @@ function tar(): Buffer {
   ]);
 }
 
+/** 在测试目录内生成多种分发格式和一个穿越样本，不依赖外部归档工具或远程下载。 */
 export async function createArchiveFixtures(
   directory: string,
 ): Promise<{ archives: Map<string, string>; unsafe: string }> {

@@ -10,17 +10,21 @@ export interface RuntimeTarget {
   runtimeId?: string | undefined;
   sessionId?: string | undefined;
 }
+
+/** 认证绑定实际 ACP Runtime；探测缓存只能展示方法，不能证明当前连接已经登录。 */
 export class AuthService {
   constructor(
     readonly runtimes: RuntimeService,
     readonly interactions: InteractionService,
   ) {}
+
   async target(ctx: Context, target: RuntimeTarget): Promise<RuntimeRecord> {
     if (target.runtimeId) return this.runtimes.get(ctx, target.runtimeId, true);
     const session = await this.runtimes.store.get<SessionRecord>('session', target.sessionId!);
     if (!session) return fail('SESSION_NOT_FOUND', '会话不存在。');
     return this.runtimes.get(ctx, session.runtimeId, true);
   }
+
   async methods(ctx: Context, target: RuntimeTarget & { configId?: string | undefined }) {
     if (target.configId) {
       const cached = await this.runtimes.store.get('probe', target.configId);
@@ -35,6 +39,8 @@ export class AuthService {
       authMethods: runtime.initialize?.authMethods ?? [],
     };
   }
+
+  /** 在生命周期互斥区内认证或退出登录，拒绝与活动 prompt、控制请求并发。 */
   async authenticate(
     ctx: Context,
     args: RuntimeTarget & {
@@ -87,6 +93,7 @@ export class AuthService {
           if (!method) fail('CONFIG_INVALID', '认证方式未由此连接公布。');
           if (!this.runtimes.channelAvailable(ctx, args.interactionChannel ?? 'none'))
             fail('INTERACTION_CHANNEL_UNAVAILABLE', '请求入口没有真实交互通道。');
+          // terminal 认证由宿主交互式进程执行，不发送 authenticate；成功后重新初始化 ACP。
           if ('type' in method && method.type === 'terminal') {
             if (current.sessionId)
               fail(
@@ -138,6 +145,7 @@ export class AuthService {
                 )
                   fail('CANCELLED', '重连期间 Runtime 已关闭。');
                 handle.client = client;
+                // 新连接不能继承旧连接的认证结论；提升代次使旧交互答复失效。
                 const next: RuntimeRecord = {
                   ...latest,
                   revision: latest.revision + 1,

@@ -7,22 +7,29 @@ import { access } from '../domain/access-control.js';
 import type { Context, SegmentRecord, SessionRecord } from '../domain/models.js';
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 
+/** 游标绑定流和筛选摘要，不能跨会话或改筛选条件继续翻页。 */
 interface Cursor {
   streamId: string;
   after: string;
   filter: string;
 }
+
+/** 组织会话事件、无任务事件段和大内容引用，并生成可验证且能感知清理缺口的游标。 */
 export class EventService {
   readonly replay = new Map<string, string>();
+
   constructor(
     readonly store: SqliteStore,
     readonly dataDir: string,
     private readonly cursorKey: string,
   ) {}
+
   encode(cursor: Cursor) {
     const body = Buffer.from(JSON.stringify(cursor)).toString('base64url');
     return `${body}.${createHmac('sha256', this.cursorKey).update(body).digest('base64url')}`;
   }
+
+  /** 先验证 HMAC 再使用游标字段；签名只保证完整性，访问授权由上层单独执行。 */
   decode(value: string, streamId: string, filter: string) {
     try {
       const [body, signature] = value.split('.');
@@ -39,6 +46,11 @@ export class EventService {
       return fail('CURSOR_EXPIRED', '游标无效或与当前流及筛选条件不匹配。');
     }
   }
+
+  /**
+   * 超过 64 KiB 的 JSON 写入按内容寻址的文件，返回资源引用以限制事件与结果体积。
+   * objectId 决定读取归属，unitId 关联可清理的任务或事件段；共享内容由引用共同保活。
+   */
   async externalize(objectId: string, payload: unknown, unitId = objectId) {
     if (bytes(payload) <= 64 * 1024) return payload;
     const contentId = digest(payload);
@@ -75,6 +87,8 @@ export class EventService {
       };
     });
   }
+
+  /** ambient 段按 8 MiB 或一小时滚动封口；history_replay 每次恢复单独建段。 */
   async segment(session: SessionRecord, kind: SegmentRecord['kind'] = 'ambient') {
     if (kind === 'ambient') {
       const existing = (await this.store.list<SegmentRecord>('segment')).find(
@@ -106,6 +120,7 @@ export class EventService {
     await this.store.put('segment', segment);
     return segment.id;
   }
+
   async seal(segmentId: string) {
     const segment = await this.store.get<SegmentRecord>('segment', segmentId);
     if (segment?.state === 'open')
@@ -116,10 +131,13 @@ export class EventService {
         sealedAt: now(),
       });
   }
+
   async closeActivation(activationId: string) {
     for (const segment of await this.store.list<SegmentRecord>('segment'))
       if (segment.activationId === activationId) await this.seal(segment.id);
   }
+
+  /** 回放优先于活动任务归属，其余通知分别进入当前 task 或可独立清理的 ambient 段。 */
   async append(
     session: SessionRecord,
     kind: string,
@@ -138,6 +156,8 @@ export class EventService {
       ...(projection ? { projection } : {}),
     });
   }
+
+  /** 兼顾条数和 1 MiB 页大小上限；墓碑区间会明确报告历史不完整，不伪装成空页。 */
   async read(
     streamId: string,
     args: {
@@ -167,6 +187,7 @@ export class EventService {
       return size <= 1024 ** 2;
     });
     const hasMore = items.length < result.items.length;
+    // 无更多匹配项时推进到流高水位，避免筛选后的空区间被反复扫描。
     const last = hasMore ? (items.at(-1)?.seq ?? after) : result.highWatermark;
     const missing = result.missing
       .filter((range) => BigInt(range.from) <= BigInt(last))
@@ -185,6 +206,7 @@ export class EventService {
       earliestAvailableCursor: this.encode({ streamId, after: '0', filter }),
     };
   }
+
   async sessionRead(ctx: Context, sessionId: string, args: Parameters<EventService['read']>[1]) {
     const session = await this.store.get<SessionRecord>('session', sessionId);
     if (!session) return fail('SESSION_NOT_FOUND', '会话不存在。');
@@ -200,6 +222,8 @@ export class EventService {
     }
     return this.read(sessionId, args);
   }
+
+  /** 校验对象确实引用该内容；按字节分页并返回 base64，避免 UTF-8 字符跨页被破坏。 */
   async content(objectId: string, contentId: string, offset = 0, maxBytes = 64 * 1024) {
     if (
       !/^[a-f0-9]{64}$/.test(contentId) ||

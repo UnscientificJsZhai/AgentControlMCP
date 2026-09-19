@@ -20,6 +20,8 @@ import { createMcpTools, describeTool } from '../transport/mcp/catalog.js';
 
 const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识>\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content <子命令>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出全部 CLI 操作及参数 Schema）\ntools --mcp （输出实际公开的 MCP 工具及参数 Schema）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
 const flags = new Set(['json', 'help', 'no-wait', 'interactive', 'yes', 'mcp']);
+
+/** 将位置参数与选项分开；复杂结构交给 --file/--input 的 JSON 和具体工具 Schema 校验。 */
 function parse(argv: string[]) {
   const positional: string[] = [];
   const options: Record<string, string | boolean> = {};
@@ -40,6 +42,7 @@ function parse(argv: string[]) {
   }
   return { positional, options };
 }
+
 const unwrap = (value: unknown): unknown => {
   const record = value as {
     ok?: boolean;
@@ -52,6 +55,7 @@ const unwrap = (value: unknown): unknown => {
 };
 const output = (value: unknown) => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
 
+/** 统一处理服务启动、本地管理与工具调用；优先通过 IPC 使用已有实例中的活动资源。 */
 export async function main(argv = process.argv.slice(2)) {
   if (argv.includes('--version')) {
     process.stdout.write('1.0.0\n');
@@ -113,6 +117,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     return;
   }
+  // 目录构造不会访问容器，可在没有数据目录或运行实例时输出工具 Schema。
   if (group === 'tools') {
     output(
       options.mcp
@@ -141,6 +146,7 @@ export async function main(argv = process.argv.slice(2)) {
   } finally {
     await store.close();
   }
+  // 默认优先选择 HTTP 服务；多个 stdio 实例并存时不能猜测目标，需明确指定。
   const instance = options.instance
     ? instances.find((item) => item.id === options.instance)
     : (instances.find((item) => item.mode === 'http') ??
@@ -195,6 +201,7 @@ export async function main(argv = process.argv.slice(2)) {
       : options.input
         ? z.record(z.string(), z.unknown()).parse(JSON.parse(String(options.input)) as unknown)
         : {};
+  // 人用短选项映射为协议字段；完整 JSON 输入则直接沿用工具契约。
   const keyAliases: Record<string, string> = {
     config: 'configId',
     runtime: 'runtimeId',
@@ -246,6 +253,7 @@ export async function main(argv = process.argv.slice(2)) {
     args.config = config;
   }
   if (options.interactive) args.interactionChannel = 'local_cli';
+  // 单次 CLI 写调用默认取得新幂等键；跨进程重试需要用户复用显式提供的键。
   const definition = createTools({} as Container).find((item) => item.name === name);
   if (
     definition &&
@@ -322,6 +330,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     let response = await call(name, args);
     const op = response as { operationId?: string; state?: string; revision?: number };
+    // 默认等待耗时操作；缺少真实交互附着时返回 waiting_interaction，让用户决定下一步。
     if (op.operationId && !options['no-wait']) {
       for (;;) {
         response = await call('operation_wait', { operationId: op.operationId, timeoutMs: 1000 });
@@ -358,6 +367,8 @@ async function presentPending(instance: InstanceRecord, presentationSession: str
   ) as { items: InteractionRecord[] };
   for (const item of response.items) await presentOne(instance, item, presentationSession);
 }
+
+/** 在真实终端展示请求并收集输入，通过附着凭证取得收据后再提交答复。 */
 async function presentOne(
   instance: InstanceRecord,
   item: InteractionRecord,
@@ -390,6 +401,7 @@ async function presentOne(
       await rl.question('请在浏览器完成上方 URL 的交互，完成后按回车：');
       decision = { action: 'accept' };
     } else if (item.type === 'terminal_auth') {
+      // 认证子进程继承终端，参数保持 argv 数组；退出码由认证服务决定是否可以重建连接。
       rl.close();
       const config = agentConfig.parse(item.request.snapshot);
       const method = item.request.method as { args?: string[]; env?: Record<string, string> };
@@ -466,6 +478,8 @@ async function presentOne(
     ).data,
   );
 }
+
+/** 持有一个附着连接并轮询交互；Ctrl-C 只结束附着，不停止被管理的服务实例。 */
 async function attach(instance: InstanceRecord) {
   if (!process.stdin.isTTY || !process.stdout.isTTY)
     fail('INTERACTION_CHANNEL_UNAVAILABLE', 'attach 需要真实宿主终端。');
@@ -488,6 +502,7 @@ async function attach(instance: InstanceRecord) {
   }
 }
 
+/** 错误统一写 stderr，避免污染 stdio MCP 输出；区分输入错误、用户取消和执行失败退出码。 */
 export function reportFailure(error: unknown) {
   const detail = errorDetail(error);
   process.stderr.write(JSON.stringify({ ok: false, error: detail }) + '\n');

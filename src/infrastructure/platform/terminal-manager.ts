@@ -17,8 +17,11 @@ interface Terminal {
   discarded: number;
   decoder: StringDecoder;
 }
+
+/** 管理 ACP 创建的命令进程及有限输出缓存；所有查询均绑定原 Runtime，不能跨连接使用。 */
 export class TerminalManager {
   private readonly terminals = new Map<string, Terminal>();
+
   async create(
     runtimeId: string,
     request: CreateTerminalRequest,
@@ -57,6 +60,7 @@ export class TerminalManager {
       discarded: 0,
       decoder: new StringDecoder('utf8'),
     };
+    // stdout/stderr 共用字节预算；StringDecoder 处理 chunk 边界上的 UTF-8 半个字符。
     const append = (chunk: Buffer) => {
       const available = Math.max(0, terminal.limit - terminal.bytes);
       const accepted = chunk.subarray(0, available);
@@ -69,12 +73,14 @@ export class TerminalManager {
     this.terminals.set(terminal.id, terminal);
     return { terminalId: terminal.id };
   }
+
   private get(runtimeId: string, terminalId: string) {
     const terminal = this.terminals.get(terminalId);
     if (!terminal || terminal.runtimeId !== runtimeId)
       return fail('OBJECT_NOT_FOUND', '终端不存在或不属于此 Runtime。');
     return terminal;
   }
+
   output(runtimeId: string, terminalId: string): TerminalOutputResponse {
     const terminal = this.get(runtimeId, terminalId);
     return {
@@ -85,6 +91,8 @@ export class TerminalManager {
         : {}),
     };
   }
+
+  /** 取消只终止本次等待，命令仍运行；终止命令或释放资源需调用 kill/release。 */
   async wait(runtimeId: string, terminalId: string, signal: AbortSignal) {
     const terminal = this.get(runtimeId, terminalId);
     let abort: (() => void) | undefined;
@@ -102,15 +110,18 @@ export class TerminalManager {
       if (abort) signal.removeEventListener('abort', abort);
     }
   }
+
   async kill(runtimeId: string, terminalId: string) {
     await this.get(runtimeId, terminalId).host.stop();
     return {};
   }
+
   async release(runtimeId: string, terminalId: string) {
     await this.kill(runtimeId, terminalId);
     this.terminals.delete(terminalId);
     return {};
   }
+
   async close(runtimeId: string) {
     await Promise.allSettled(
       [...this.terminals.values()]

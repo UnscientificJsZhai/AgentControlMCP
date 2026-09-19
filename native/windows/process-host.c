@@ -30,6 +30,7 @@ int wmain(int argc, wchar_t **argv) {
   if (!parent) return 70;
   HANDLE job = CreateJobObjectW(NULL, NULL);
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+  // 最后一个 Job 句柄关闭时回收全部后代，覆盖监督进程意外退出的路径。
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return 70;
   size_t size = 1;
@@ -44,8 +45,10 @@ int wmain(int argc, wchar_t **argv) {
   PROCESS_INFORMATION child = {0};
   if (!CreateProcessW(argv[3], command, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &startup, &child)) { free(command); CloseHandle(job); CloseHandle(parent); return 71; }
   free(command);
+  // 子进程仍处于挂起状态，加入 Job 成功后才允许运行，避免先启动后纳管的竞态。
   if (!AssignProcessToJobObject(job, child.hProcess)) { TerminateProcess(child.hProcess, 72); CloseHandle(child.hThread); CloseHandle(child.hProcess); CloseHandle(job); CloseHandle(parent); return 72; }
   ResumeThread(child.hThread); CloseHandle(child.hThread);
+  // 同时等待下游和监督父进程；父进程先退出时关闭 Job，由内核清理下游进程树。
   HANDLE watched[2] = {child.hProcess, parent};
   DWORD winner = WaitForMultipleObjects(2, watched, FALSE, INFINITE), code = 1;
   if (winner == WAIT_OBJECT_0) GetExitCodeProcess(child.hProcess, &code);

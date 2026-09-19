@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
+// 发布前同时检查两种 Windows 架构的 PE 头；文件存在不能证明它是匹配架构的可执行产物。
 for (const [arch, machine] of [
   ['x64', 0x8664],
   ['arm64', 0xaa64],
