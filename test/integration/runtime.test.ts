@@ -117,6 +117,9 @@ void test(
         async () => (await h.app.interactions.list(h.alice, { taskId: task.taskId }, true))[0],
       );
       await assert.rejects(h.app.tasks.get(h.bob, task.taskId), { code: 'SESSION_NOT_FOUND' });
+      // 审批回调可先于前面的通知落盘；等通知更新完会话修订后再准备移交，避免误用旧修订。
+      const runtime = await h.app.runtimes.get(h.alice, session.runtimeId);
+      await h.app.runtimes.handle(runtime).client.barrier();
       const before = await h.app.sessions.get(h.alice, session.sessionId);
       await h.app.sessions.ownership(h.alice, 'transfer', {
         sessionId: before.id,

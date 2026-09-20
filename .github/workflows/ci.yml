@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   windows-host:
-    name: 构建 Windows 进程宿主
+    name: Build Windows process host
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -24,7 +24,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24.16.0'
-      - name: MSVC 编译 x64 和 ARM64
+      - name: Compile x64 and ARM64 with MSVC
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "ACM_VS_ROOT=%%i"
@@ -40,6 +40,8 @@ jobs:
             native/win32-x64/process-host.exe
             native/win32-arm64/process-host.exe
           if-no-files-found: error
+          # 保留重跑和本地复现所需的产物，覆盖 GitHub 的 30 天重跑窗口后自动清理。
+          retention-days: 30
   check:
     needs: windows-host
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
@@ -54,25 +56,25 @@ jobs:
           - os: ubuntu-latest
             node: '24.13.0'
     steps:
-      - name: 检出代码
+      - name: Check out code
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: 配置 Node.js 和 npm 缓存
+      - name: Set up Node.js and npm cache
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           check-latest: true
           cache: npm
           cache-dependency-path: package-lock.json
-      - name: 安装锁定依赖
+      - name: Install locked dependencies
         run: npm ci
-      - name: 获取本次源码编译的进程宿主
+      - name: Download compiled Windows process host
         uses: actions/download-artifact@v8
         with:
           name: windows-process-host
           path: native
-      - name: 运行工程检查
+      - name: Run project checks
         run: npm run check
-      - name: 检查 npm 打包内容
+      - name: Check npm package contents
         run: npm pack --dry-run

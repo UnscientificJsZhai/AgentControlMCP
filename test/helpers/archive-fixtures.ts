@@ -1,7 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { crc32, gzipSync } from 'node:zlib';
-import BZip2 from '@digitaldefiance/bzip2-wasm';
 import { Header } from 'tar';
 
 const agent = Buffer.from("#!/usr/bin/env node\nconsole.log('binary-fixture-1.0.0');\n");
@@ -62,9 +61,14 @@ export async function createArchiveFixtures(
 ): Promise<{ archives: Map<string, string>; unsafe: string }> {
   const raw = tar();
   const gzip = gzipSync(raw);
-  const compressor = new BZip2();
-  await compressor.init();
-  const bzip = compressor.compress(raw, 1, raw.length + Math.ceil(raw.length * 0.01) + 600);
+  // 固定样本由 tar() 的输出经 bzip2 -1c 生成，包含 bin/agent 和相对符号链接 alias。
+  // 修改 agent 或 tar() 时需同步重建；测试运行时不再依赖 WASM 压缩器的平台路径解析。
+  const bzip = Buffer.from(
+    'QlpoMTFBWSZTWTW6hYcAAFnblNQyauP3jACIf6WfYARABAAACCAAlAlQmJNqAaDQ00Mamgek9T1BokNACYAA' +
+      'hkxqYRiS8BQUhbomzCEkCAP6DJAImCB2ZIortfBmD3k/Muq88M0WZ5oGtPFg5KCwUKECS4rvfZ0nEbu1455yY' +
+      '0TS+5a035BDyXc3wllbzwjjZG0nqbAZiEVrt0h8W9FNGMaBX5QxSEkxKrVLBujbWB/F3JFOFCQNbqFhwA==',
+    'base64',
+  );
   const samples: Record<string, Uint8Array> = {
     zip: zip('bin/agent'),
     'tar.gz': gzip,

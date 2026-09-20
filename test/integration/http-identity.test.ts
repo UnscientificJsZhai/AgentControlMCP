@@ -57,6 +57,11 @@ void test(
       const pending = await until(
         async () => (await h.app.interactions.list(ctx, { taskId: String(task.taskId) }, true))[0],
       );
+      // 审批记录先于任务状态落盘；断线前先确认待审批，断线后再验证该状态保持。
+      await until(
+        async () =>
+          (await call(first, 'task_get', { taskId: task.taskId })).state === 'waiting_interaction',
+      );
       await first.close();
       assert.equal((await h.app.tasks.get(ctx, String(task.taskId))).state, 'waiting_interaction');
       const reconnected = await connect(a.token);

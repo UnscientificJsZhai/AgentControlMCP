@@ -105,7 +105,12 @@ void test('AC-026/027: 已接受取消的清理不受随后移交阻断', { time
       prompt: [{ type: 'text', text: 'slow' }],
       idempotencyKey: id('task'),
     });
-    await until(async () => (await h.app.tasks.get(h.alice, task.taskId)).state === 'running');
+    // running 先于下游通知落盘；等 fixture 最后一条初始更新，避免移交使用过期修订。
+    await until(async () =>
+      (await h.app.events.read(session.sessionId, { taskId: task.taskId })).items.some(
+        (event) => event.kind === 'usage_update',
+      ),
+    );
     let entered!: () => void;
     const reached = new Promise<void>((resolve) => {
       entered = resolve;
@@ -121,15 +126,21 @@ void test('AC-026/027: 已接受取消的清理不受随后移交阻断', { time
       await cancelOriginal(...args);
     };
     const cancellation = h.app.tasks.cancel(h.alice, task.taskId);
-    await reached;
-    const before = await h.app.sessions.get(h.alice, session.sessionId);
-    await h.app.sessions.ownership(h.alice, 'transfer', {
-      sessionId: before.id,
-      targetPrincipalId: h.bob.principalId,
-      expectedRevision: before.revision,
-      idempotencyKey: id('transfer'),
-    });
-    release();
+    try {
+      await reached;
+      const before = await h.app.sessions.get(h.alice, session.sessionId);
+      await h.app.sessions.ownership(h.alice, 'transfer', {
+        sessionId: before.id,
+        targetPrincipalId: h.bob.principalId,
+        expectedRevision: before.revision,
+        idempotencyKey: id('transfer'),
+      });
+    } finally {
+      // 移交失败也必须解除暂停并收敛取消，否则容器关闭会一直等待任务的 finally。
+      release();
+      h.app.tasks.cancelInteractions = cancelOriginal;
+      await cancellation;
+    }
     assert.equal((await cancellation).accepted, true);
     assert.equal((await h.taskDone(task.taskId, h.bob)).state, 'cancelled');
     assert.ok(

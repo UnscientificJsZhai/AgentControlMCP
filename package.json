@@ -41,7 +41,6 @@
     "zod": "4.2.0"
   },
   "devDependencies": {
-    "@digitaldefiance/bzip2-wasm": "1.1.1",
     "@eslint/js": "10.0.1",
     "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "24.13.6",
