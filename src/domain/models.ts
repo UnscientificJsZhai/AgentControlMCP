@@ -224,7 +224,17 @@ export interface InstallationRecord extends Entity {
   args: string[];
   env: Record<string, string>;
   integrity: string;
-  state: 'ready';
+  state: 'ready' | 'removing';
+  binDir?: string;
+}
+
+/** 作业先登记归属再创建文件，崩溃后的目录仍可诊断和手动回收。 */
+export interface InstallationJob extends Entity {
+  instanceId: string;
+  lockHolder: string;
+  key: string;
+  state: 'waiting' | 'running' | 'cleanup_pending' | 'ended';
+  paths?: { installation: string; staging: string; cache: string };
 }
 
 export interface Principal extends Entity {

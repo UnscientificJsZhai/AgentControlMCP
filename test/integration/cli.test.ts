@@ -22,7 +22,7 @@ void test('CLI 保留原命令、call、自动幂等键，并提供 tools --mcp'
   try {
     const definitions = z.array(z.object({ name: z.string() }));
     const original = definitions.parse(await run('tools'));
-    assert.equal(original.length, 62);
+    assert.equal(original.length, 64);
     assert.ok(original.some((tool) => tool.name === 'agent_register'));
     const published = await run('tools', '--mcp');
     assert.deepEqual(published, createMcpTools({} as Container).map(describeTool));

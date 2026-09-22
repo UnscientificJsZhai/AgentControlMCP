@@ -1,6 +1,6 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readFile, mkdtemp, writeFile } from 'node:fs/promises';
+import { readFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { z } from 'zod';
 import type { Container } from '../../bootstrap/container.js';
 import type { Context } from '../../domain/models.js';
@@ -85,7 +85,7 @@ export async function adminCommand(
     if (name === '_config_validate')
       return { valid: true, documentId: document.documentId, revision: document.revision };
     if (document.kind === 'connector')
-      return new SettingsService(app.store, app.dataDir).apply(document);
+      return new SettingsService(app.store, app.paths.configDir).apply(document);
     // 可编辑文档允许替换配置内容，但来源身份不可借导入文件悄悄改绑。
     const { origin, ...value } = document.value;
     const original = await app.configs.get(document.documentId);
@@ -106,7 +106,7 @@ export async function adminCommand(
   // 编辑器操作临时副本，只有后续 apply 通过 Schema 与修订检查才改变数据库事实。
   if (name === '_config_edit') {
     const configId = z.string().parse(args.configId);
-    const settings = new SettingsService(app.store, app.dataDir);
+    const settings = new SettingsService(app.store, app.paths.configDir);
     const record = configId === 'connector' ? null : await app.configs.get(configId);
     const dir = await mkdtemp(join(tmpdir(), 'agent-control-edit-'));
     const path = join(dir, 'config.json');
@@ -114,8 +114,8 @@ export async function adminCommand(
     try {
       content = await readFile(
         configId === 'connector'
-          ? join(app.dataDir, 'config/connector.json')
-          : join(app.dataDir, 'config/agents', `${configId}.json`),
+          ? join(app.paths.configDir, 'connector.json')
+          : join(app.paths.configDir, 'agents', `${configId}.json`),
         'utf8',
       );
     } catch {
@@ -125,7 +125,12 @@ export async function adminCommand(
         2,
       );
     }
-    await writeFile(path, content, { mode: 0o600 });
+    try {
+      await writeFile(path, content, { mode: 0o600 });
+    } catch (error) {
+      await rm(dir, { recursive: true, force: true });
+      throw error;
+    }
     return { path };
   }
   if (name === '_interaction_get')
@@ -133,7 +138,7 @@ export async function adminCommand(
   if (name === '_config_export') {
     const configId = z.string().parse(args.configId);
     return configId === 'connector'
-      ? new SettingsService(app.store, app.dataDir).export(true)
+      ? new SettingsService(app.store, app.paths.configDir).export(true)
       : app.configs.project(await app.configs.get(configId), true);
   }
   if (name === '_present_receipt') {

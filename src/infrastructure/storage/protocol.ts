@@ -12,6 +12,7 @@ export interface Check {
   id: string;
   revision?: number;
   absent?: boolean;
+  state?: string;
 }
 
 export interface Idempotency {

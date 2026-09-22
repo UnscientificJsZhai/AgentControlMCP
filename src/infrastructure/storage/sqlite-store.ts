@@ -1,5 +1,5 @@
 import { Worker } from 'node:worker_threads';
-import { chmod, mkdir } from 'node:fs/promises';
+import { chmod, mkdir, open } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { id } from '../../domain/ids.js';
@@ -51,10 +51,27 @@ export class SqliteStore {
   /** 首次读取充当就绪屏障，确认 Worker 已建库后再收紧数据库文件权限。 */
   static async open(path: string) {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    // SQLite 创建 WAL/SHM 时沿用数据库权限，首次建库前就限制为仅当前用户可读写。
+    try {
+      await (await open(path, 'ax', 0o600)).close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
     const store = new SqliteStore(path);
-    await store.list('meta');
-    await chmod(path, 0o600);
-    return store;
+    try {
+      await store.list('meta');
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          await chmod(path + suffix, 0o600);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+      return store;
+    } catch (error) {
+      await store.close().catch(() => store.worker.terminate());
+      throw error;
+    }
   }
 
   call<T>(method: string, args: unknown): Promise<T> {
@@ -87,6 +104,20 @@ export class SqliteStore {
     return this.call<CommitResult>('commit', input);
   }
 
+  /** 安装和手动文件作业共用此恢复规则，仅接管已确认退出的持有者。 */
+  async releaseDeadLock(key: string) {
+    const previous = await this.claim(key);
+    if (!previous) return;
+    const pid = Number(previous.split(':')[0]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) return;
+    try {
+      process.kill(pid, 0);
+    } catch (reason) {
+      if ((reason as NodeJS.ErrnoException).code === 'ESRCH')
+        await this.commit({ releases: [{ key, holder: previous }] });
+    }
+  }
+
   /**
    * 通过持久化 claim 协调数据库事务以外的文件操作，最多等待三十秒取得锁。
    * 仅 ESRCH 能证明原持有进程不存在；权限不足等探测失败不能作为抢占依据。
@@ -105,15 +136,7 @@ export class SqliteStore {
           Date.now() >= deadline
         )
           throw error;
-        const previous = await this.claim(key);
-        if (previous) {
-          try {
-            process.kill(Number(previous.split(':')[0]), 0);
-          } catch (reason) {
-            if ((reason as NodeJS.ErrnoException).code === 'ESRCH')
-              await this.commit({ releases: [{ key, holder: previous }] });
-          }
-        }
+        await this.releaseDeadLock(key);
         await delay(10);
       }
     }

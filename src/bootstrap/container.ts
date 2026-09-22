@@ -1,5 +1,11 @@
-import { mkdir, realpath } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import {
+  createRuntimeDirectory,
+  initializeStoragePaths,
+  resolveStoragePaths,
+} from '../infrastructure/storage/paths.js';
+import type { StoragePaths } from '../infrastructure/storage/paths.js';
+import { StorageService } from '../application/storage-service.js';
+import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type * as acp from '@agentclientprotocol/sdk';
@@ -35,13 +41,7 @@ import { recover } from '../application/recovery-service.js';
 import { fingerprint } from '../adapters/local/codex.js';
 import { SettingsService } from '../application/settings-service.js';
 
-export const defaultDataDir = () =>
-  process.env.AGENT_CONTROL_MCP_DATA_DIR ??
-  (process.platform === 'darwin'
-    ? join(homedir(), 'Library/Application Support/AgentControlMCP')
-    : process.platform === 'win32'
-      ? join(process.env.LOCALAPPDATA ?? homedir(), 'AgentControlMCP')
-      : join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local/share'), 'agent-control-mcp'));
+export const defaultDataDir = () => resolveStoragePaths().dataDir;
 
 /**
  * 单个服务实例的装配根：创建应用服务，并把协议回调、权限查询和资源回收连接起来。
@@ -62,6 +62,10 @@ export class Container {
   readonly installations;
   readonly local;
   readonly history;
+  readonly storage;
+  get dataDir() {
+    return this.paths.dataDir;
+  }
   readonly terminals = new TerminalManager();
   readonly admin: Context;
   readonly attachedChannels = new Set<string>();
@@ -72,14 +76,16 @@ export class Container {
 
   private constructor(
     readonly store: SqliteStore,
-    readonly dataDir: string,
+    readonly paths: StoragePaths,
     readonly settings: Settings,
     readonly serviceId: string,
     cursorKey: string,
     readonly mode: Context['mode'],
   ) {
+    const dataDir = paths.dataDir;
+    this.storage = new StorageService(store, paths);
     this.admin = { principalId: 'local_admin', mode: 'cli', serviceId, admin: true };
-    this.configs = new ConfigService(store, dataDir);
+    this.configs = new ConfigService(store, paths.configDir);
     this.operations = new OperationService(store, this.instanceId);
     this.runtimes = new RuntimeService(
       store,
@@ -88,7 +94,7 @@ export class Container {
       this.instanceId,
       settings,
     );
-    this.events = new EventService(store, dataDir, cursorKey);
+    this.events = new EventService(store, paths, cursorKey);
     this.sessions = new SessionService(store, this.runtimes, this.operations, this.events);
     this.tasks = new TaskService(store, this.sessions);
     this.interactions = new InteractionService(store, this.runtimes, this.tasks);
@@ -98,7 +104,7 @@ export class Container {
     this.installations = new InstallationService(
       store,
       this.registry,
-      new Installer(dataDir, settings.allowInsecureRegistry),
+      new Installer(paths, settings.allowInsecureRegistry, settings.minimumFreeBytes),
       this.operations,
       this.configs,
       settings.maxInstallations,
@@ -109,10 +115,7 @@ export class Container {
     const endpoint =
       process.platform === 'win32'
         ? `\\\\.\\pipe\\agentcontrol-${digest(dataDir).slice(0, 12)}-${this.instanceId}`
-        : join(
-            tmpdir(),
-            `acm-${process.getuid?.() ?? 'user'}-${digest(dataDir).slice(0, 10)}-${this.instanceId.slice(-12)}.sock`,
-          );
+        : join(paths.runtimeDir, 'admin.sock');
     this.instance = {
       id: this.instanceId,
       revision: 1,
@@ -188,10 +191,9 @@ export class Container {
       settings?: Partial<Settings>;
     } = {},
   ) {
-    const path = options.dataDir ?? defaultDataDir();
-    await mkdir(path, { recursive: true, mode: 0o700 });
-    const dataDir = await realpath(path);
-    const store = await SqliteStore.open(join(dataDir, 'state/state.db'));
+    const paths = await initializeStoragePaths(resolveStoragePaths({ dataDir: options.dataDir }));
+    const store = await SqliteStore.open(paths.databasePath);
+    let runtimeDirectory: string | undefined;
     try {
       await recover(store);
       let meta = await store.get<{ serviceId: string; cursorKey: string; settings: Settings }>(
@@ -218,9 +220,11 @@ export class Container {
         }
         meta = (await store.get<typeof created>('meta', 'connector'))!;
       }
+      runtimeDirectory = await createRuntimeDirectory(paths);
+      paths.runtimeDir = runtimeDirectory;
       const container = new Container(
         store,
-        dataDir,
+        paths,
         settingsSchema.parse({ ...meta.settings, ...options.settings }),
         meta.serviceId,
         meta.cursorKey,
@@ -232,7 +236,7 @@ export class Container {
           container.mode === 'http' ? [{ key: 'http_service', holder: container.instanceId }] : [],
       });
       await container.registry.initialize();
-      await new SettingsService(store, dataDir).export();
+      await new SettingsService(store, paths.configDir).export();
       // 心跳供本地诊断使用，自动恢复另以进程存活检查为准；unref 避免定时器维持进程存活。
       container.timer = setInterval(() => {
         void (async () => {
@@ -253,6 +257,7 @@ export class Container {
       }
       return container;
     } catch (error) {
+      if (runtimeDirectory) await rm(runtimeDirectory, { recursive: true, force: true });
       await store.close();
       throw error;
     }
@@ -373,6 +378,7 @@ export class Container {
     await this.operations.close();
     await this.tasks.close();
     await this.onShutdown();
+    if (this.paths.runtimeDir) await rm(this.paths.runtimeDir, { recursive: true, force: true });
     const instance = await this.store.get<InstanceRecord>('instance', this.instanceId);
     if (instance)
       await this.store.commit({

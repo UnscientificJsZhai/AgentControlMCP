@@ -361,7 +361,7 @@ void test('AC-013/018/019/024: 身份轮换原子撤销旧凭据，服务文档 
     assert.equal(rotated.principalId, original.principalId);
     await assert.rejects(h.app.identities.check(current), { code: 'UNAUTHENTICATED' });
     await h.app.identities.authenticate(`Bearer ${rotated.token}`);
-    const settings = new SettingsService(h.app.store, h.app.dataDir);
+    const settings = new SettingsService(h.app.store, h.app.paths.configDir);
     const doc = await settings.document();
     await settings.apply({ ...doc, value: { ...doc.value, retentionDays: 7 } });
     await assert.rejects(settings.apply(doc), { code: 'REVISION_CONFLICT' });

@@ -1,10 +1,11 @@
-import { readFile, mkdir } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { initializeStoragePaths, resolveStoragePaths } from '../infrastructure/storage/paths.js';
+import { readFile, rm } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import { Container, defaultDataDir } from '../bootstrap/container.js';
+import { Container } from '../bootstrap/container.js';
 import { startHttp, startStdio, validateHttpOptions } from '../transport/mcp/serve.js';
 import { adminCommand } from '../transport/admin/commands.js';
 import { adminRequest, startAdmin } from '../transport/admin/ipc.js';
@@ -18,7 +19,7 @@ import { id } from '../domain/ids.js';
 import { createTools } from '../transport/mcp/tools.js';
 import { createMcpTools, describeTool } from '../transport/mcp/catalog.js';
 
-const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识>\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content <子命令>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出全部 CLI 操作及参数 Schema）\ntools --mcp （输出实际公开的 MCP 工具及参数 Schema）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
+const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识>\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content / storage <子命令>\nstorage usage\nstorage cleanup [--scope orphans|cache]（默认只预览）\nstorage cleanup --mode apply --cleanup-plan-id <ID> --plan-digest <摘要>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出全部 CLI 操作及参数 Schema）\ntools --mcp （输出实际公开的 MCP 工具及参数 Schema）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
 const flags = new Set(['json', 'help', 'no-wait', 'interactive', 'yes', 'mcp']);
 
 /** 将位置参数与选项分开；复杂结构交给 --file/--input 的 JSON 和具体工具 Schema 校验。 */
@@ -71,7 +72,8 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write('1.0.0\n');
     return;
   }
-  const dataDir = resolve(String(options['data-dir'] ?? defaultDataDir()));
+  const dataDir = options['data-dir'] === undefined ? undefined : String(options['data-dir']);
+  let paths = resolveStoragePaths({ dataDir });
   if (group === 'serve') {
     if (sub !== 'stdio' && sub !== 'http') fail('CONFIG_INVALID', '请选择 stdio 或 http。');
     const requestedHttp = {
@@ -130,8 +132,8 @@ export async function main(argv = process.argv.slice(2)) {
     );
     return;
   }
-  await mkdir(join(dataDir, 'state'), { recursive: true, mode: 0o700 });
-  const store = await SqliteStore.open(join(dataDir, 'state/state.db'));
+  paths = await initializeStoragePaths(paths);
+  const store = await SqliteStore.open(paths.databasePath);
   let instances: InstanceRecord[];
   try {
     instances = (await store.list<InstanceRecord>('instance')).filter((instance) => {
@@ -272,6 +274,7 @@ export async function main(argv = process.argv.slice(2)) {
       '运行态操作需要存活服务，请先启动 serve http，再指定 --instance。',
     );
   let attached: { data: unknown; close: () => void } | undefined;
+  let editPath: string | undefined;
   try {
     if (!instance) app = await Container.create({ dataDir, mode: 'cli' });
     if (options.interactive) {
@@ -289,6 +292,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     if (group === 'config' && sub === 'edit') {
       const exported = (await call('_config_edit', args)) as { path: string };
+      editPath = exported.path;
       const editor = await which(process.env.EDITOR ?? 'vi');
       const child = spawn(editor, [exported.path], { stdio: 'inherit', shell: false });
       await new Promise<void>((resolve, reject) => {
@@ -329,6 +333,10 @@ export async function main(argv = process.argv.slice(2)) {
       return;
     }
     let response = await call(name, args);
+    if (editPath) {
+      await rm(dirname(editPath), { recursive: true, force: true });
+      editPath = undefined;
+    }
     const op = response as { operationId?: string; state?: string; revision?: number };
     // 默认等待耗时操作；缺少真实交互附着时返回 waiting_interaction，让用户决定下一步。
     if (op.operationId && !options['no-wait']) {
@@ -355,6 +363,15 @@ export async function main(argv = process.argv.slice(2)) {
       }
     }
     output(response);
+  } catch (error) {
+    if (editPath) {
+      const detail = errorDetail(error);
+      throw new AppError(detail.code, detail.message, {
+        ...detail.details,
+        recoveryPath: editPath,
+      });
+    }
+    throw error;
   } finally {
     attached?.close();
     await app?.close();

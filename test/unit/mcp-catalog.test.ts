@@ -49,6 +49,7 @@ const groups = {
     'history_list',
     'history_get',
     'history_usage',
+    'storage_usage',
   ],
   management_write: [
     'registry_configure',
@@ -76,15 +77,16 @@ const groups = {
     'installation_remove',
     'session_delete',
     'history_cleanup',
+    'storage_cleanup',
   ],
 };
 
-void test('MCP 固定保留 26 个交互工具，完整分配 36 个管理操作，定义不超过 30 KiB', async () => {
+void test('MCP 固定保留 26 个交互工具，完整分配 38 个管理操作，定义不超过 30 KiB', async () => {
   const app = {} as Container;
   const original = createTools(app);
   const published = createMcpTools(app);
   const names = published.map((tool) => tool.name);
-  assert.equal(original.length, 62);
+  assert.equal(original.length, 64);
   assert.equal(names.length, 30);
   assert.equal(new Set(names).size, 30);
   assert.deepEqual(

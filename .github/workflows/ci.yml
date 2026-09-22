@@ -69,6 +69,12 @@ jobs:
           cache-dependency-path: package-lock.json
       - name: Install locked dependencies
         run: npm ci
+      - name: Set up host Python for offline installation fixtures
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install pinned uv for persistent environment tests
+        run: python -m pip install uv==0.12.17
       - name: Download compiled Windows process host
         uses: actions/download-artifact@v8
         with:

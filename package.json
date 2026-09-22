@@ -61,7 +61,8 @@
     "dist",
     "native/win32-*/*.exe",
     "docs/acceptance.md",
-    "docs/mcp-tools.md"
+    "docs/mcp-tools.md",
+    "docs/storage.md"
   ],
   "exports": {
     ".": "./dist/index.js"

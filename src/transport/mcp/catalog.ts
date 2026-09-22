@@ -70,6 +70,8 @@ const managementNames = new Set([
   'history_list',
   'history_get',
   'history_usage',
+  'storage_usage',
+  'storage_cleanup',
   'history_cleanup',
 ]);
 
@@ -133,11 +135,11 @@ export function createMcpTools(app: Container): ToolDefinition[] {
   };
   const descriptions = {
     management_read:
-      '执行低频只读管理查询：连接器信息与诊断、Registry、安装、本地 Agent、认证方式、Runtime、操作事件、历史。参数未知时先调用 management_describe。',
+      '执行低频只读管理查询：连接器信息与诊断、Registry、安装、本地 Agent、认证方式、Runtime、操作事件、历史、存储用量。参数未知时先调用 management_describe。',
     management_write:
       '执行低频管理变更：Registry 配置与刷新、Agent 配置与安装升级回滚、本地复用、能力探测与认证、Runtime、会话共享移交、操作取消。参数未知时先调用 management_describe。',
     management_destructive:
-      '执行删除与清理：Agent 配置、无引用安装、已关闭下游会话、历史清理。保留原有修订、幂等和清理计划校验。参数未知时先调用 management_describe。',
+      '执行删除与清理：Agent 配置、无引用安装、已关闭下游会话、历史、缓存和孤立产物。保留修订、幂等和清理计划校验。参数未知时先调用 management_describe。',
   };
   const gateways = Object.entries(descriptions).map(([name, description]): ToolDefinition => {
     const allowed = management.filter((tool) => managementToolName(tool) === name);

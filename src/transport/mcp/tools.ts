@@ -159,6 +159,7 @@ export function createTools(app: Container): ToolDefinition[] {
       serviceId: app.serviceId,
       protocols: { acp: 1, acpSdk: '1.4.0', mcp: ['2026-07-28', '2025-11-25'], mcpSdk: '2.0.0' },
       limits: app.settings,
+      paths: app.paths,
     }),
     true,
   );
@@ -192,7 +193,8 @@ export function createTools(app: Container): ToolDefinition[] {
       return {
         dependencies,
         environmentStatus,
-        storage: await app.store.call('usage', {}),
+        storage:
+          !args.checks || args.checks.includes('storage') ? await app.storage.diagnose() : null,
         platform: process.platform,
         arch: process.arch,
         node: process.version,
@@ -921,6 +923,29 @@ export function createTools(app: Container): ToolDefinition[] {
     '读取保存的结果、事件段描述或清理墓碑。',
     obj({ kind: z.enum(['task', 'operation', 'session_event_segment']), id: text }),
     (ctx, args) => app.history.get(ctx, args.kind, args.id),
+    true,
+  );
+  add(
+    'storage_usage',
+    '统计安装、缓存、配置和历史的文件大小、可回收量及剩余磁盘空间。',
+    obj({}),
+    () => app.storage.usage(),
+    true,
+  );
+  add(
+    'storage_cleanup',
+    '手动清理缓存或孤立产物；默认预览，应用时重验计划摘要和活动保护。',
+    z.union([
+      obj({
+        mode: z.literal('plan').optional(),
+        scope: z.enum(['orphans', 'cache']).optional(),
+        ...write,
+      }),
+      obj({ mode: z.literal('apply'), cleanupPlanId: text, planDigest: text, ...write }),
+    ]),
+    (ctx, args) =>
+      args.mode === 'apply' ? app.storage.apply(ctx, args) : app.storage.plan(ctx, args),
+    false,
     true,
   );
   add(

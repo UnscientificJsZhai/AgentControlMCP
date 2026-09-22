@@ -7,12 +7,14 @@ import { now } from '../../domain/ids.js';
 // 同步数据库只在 Worker 内运行；WAL 支持多实例读取，FULL 同步用于持久化已受理的操作。
 const { path } = workerData as { path: string };
 const db = new DatabaseSync(path);
-db.exec(
-  'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;',
-);
 const version = db.prepare('PRAGMA user_version').get()?.user_version;
-if (typeof version !== 'number' || version > 1) throw new Error('不支持此数据库格式');
-db.exec(`BEGIN IMMEDIATE;
+const incompatible = version !== 0 && version !== 2;
+if (!incompatible) {
+  db.exec(
+    'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;',
+  );
+
+  db.exec(`BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id));
 CREATE TABLE IF NOT EXISTS claims(key TEXT PRIMARY KEY, holder TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS idempotency(principal TEXT, method TEXT, key TEXT, digest TEXT NOT NULL, response TEXT NOT NULL, PRIMARY KEY(principal,method,key));
@@ -21,8 +23,9 @@ CREATE TABLE IF NOT EXISTS events(stream_id TEXT NOT NULL, seq INTEGER NOT NULL,
 CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);
 CREATE INDEX IF NOT EXISTS events_segment ON events(segment_id, seq);
 CREATE TABLE IF NOT EXISTS tombstones(stream_id TEXT NOT NULL, seq INTEGER NOT NULL, task_id TEXT, segment_id TEXT, activation_id TEXT, PRIMARY KEY(stream_id,seq));
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 COMMIT;`);
+}
 
 function decode(row: Record<string, unknown> | undefined): unknown {
   return row ? (JSON.parse(row.data as string) as unknown) : null;
@@ -46,12 +49,15 @@ function transaction(input: Transaction) {
     }
     for (const check of input.checks ?? []) {
       const row = db
-        .prepare('SELECT revision FROM records WHERE kind=? AND id=?')
+        .prepare('SELECT revision,data FROM records WHERE kind=? AND id=?')
         .get(check.kind, check.id);
       if (
         check.absent
           ? !!row
-          : !row || (check.revision !== undefined && row.revision !== check.revision)
+          : !row ||
+            (check.revision !== undefined && row.revision !== check.revision) ||
+            (check.state !== undefined &&
+              (JSON.parse(row.data as string) as { state?: string }).state !== check.state)
       )
         fail('REVISION_CONFLICT', '对象修订已变化。', {
           id: check.id,
@@ -265,6 +271,11 @@ function purge(args: {
 parentPort?.on('message', (request: RpcRequest) => {
   const response: RpcResponse = { requestId: request.requestId };
   try {
+    if (incompatible && request.method !== 'close')
+      fail(
+        'STORAGE_FORMAT_UNSUPPORTED',
+        '旧存储格式不受支持，请停止实例并手动清理旧数据；不会自动迁移或删除。',
+      );
     const args = request.args as Record<string, unknown>;
     switch (request.method) {
       case 'get':

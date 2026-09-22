@@ -247,10 +247,10 @@ export class HistoryService {
       ...new Map(refs.map((ref) => [ref.contentId, ref.bytes])).values(),
     ].reduce((a, b) => a + b, 0);
     let physicalBytes = 0;
-    for (const dir of ['state', 'content']) {
+    for (const dir of [this.events.paths.stateDir, this.events.paths.contentDir]) {
       try {
-        for (const file of await readdir(join(this.events.dataDir, dir))) {
-          const info = await stat(join(this.events.dataDir, dir, file));
+        for (const file of await readdir(dir)) {
+          const info = await stat(join(dir, file));
           if (info.isFile()) physicalBytes += info.size;
         }
       } catch {
@@ -437,7 +437,7 @@ export class HistoryService {
             (ref) => ref.contentId === contentId,
           )
         ) {
-          const path = join(this.events.dataDir, 'content', contentId);
+          const path = join(this.events.paths.contentDir, contentId);
           try {
             releasedContentBytes += (await stat(path)).size;
             await rm(path);

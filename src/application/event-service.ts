@@ -1,3 +1,4 @@
+import type { StoragePaths } from '../infrastructure/storage/paths.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -20,7 +21,7 @@ export class EventService {
 
   constructor(
     readonly store: SqliteStore,
-    readonly dataDir: string,
+    readonly paths: StoragePaths,
     private readonly cursorKey: string,
   ) {}
 
@@ -55,9 +56,9 @@ export class EventService {
     if (bytes(payload) <= 64 * 1024) return payload;
     const contentId = digest(payload);
     const content = JSON.stringify(payload);
-    const path = join(this.dataDir, 'content', contentId);
+    const path = join(this.paths.contentDir, contentId);
     return this.store.locked(`content:${contentId}`, async () => {
-      await mkdir(join(this.dataDir, 'content'), { recursive: true, mode: 0o700 });
+      await mkdir(this.paths.contentDir, { recursive: true, mode: 0o700 });
       const tmp = `${path}.${id('tmp')}`;
       await writeFile(tmp, content, { mode: 0o600, flush: true });
       await rename(tmp, path);
@@ -230,7 +231,7 @@ export class EventService {
       !(await this.store.get('content_ref', `${objectId}:${contentId}`))
     )
       fail('CONTENT_UNAVAILABLE', '此对象没有引用所请求的内容。');
-    const buffer = await readFile(join(this.dataDir, 'content', contentId));
+    const buffer = await readFile(join(this.paths.contentDir, contentId));
     const chunk = buffer.subarray(offset, offset + Math.min(maxBytes, 256 * 1024));
     return {
       contentId,

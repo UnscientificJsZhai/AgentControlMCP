@@ -29,7 +29,7 @@ export const connectorDocument = z.strictObject({
 export class SettingsService {
   constructor(
     readonly store: SqliteStore,
-    readonly dataDir: string,
+    readonly configDir: string,
   ) {}
 
   async document() {
@@ -45,8 +45,8 @@ export class SettingsService {
 
   /** 默认只创建缺失文件，保留已有编辑；显式覆盖时通过临时文件替换。 */
   async export(overwrite = false) {
-    const path = join(this.dataDir, 'config/connector.json');
-    await mkdir(join(this.dataDir, 'config'), { recursive: true, mode: 0o700 });
+    const path = join(this.configDir, 'connector.json');
+    await mkdir(this.configDir, { recursive: true, mode: 0o700 });
     const content = JSON.stringify(await this.document(), null, 2) + '\n';
     if (!overwrite) {
       try {

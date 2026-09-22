@@ -1,10 +1,10 @@
-import { rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, fail } from '../domain/errors.js';
 import { digest, id, now } from '../domain/ids.js';
-import type { Context, InstallationRecord } from '../domain/models.js';
+import type { Context, InstallationRecord, InstallationJob } from '../domain/models.js';
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
+import { row } from '../infrastructure/storage/sqlite-store.js';
 import type { RegistryClient } from '../infrastructure/registry/client.js';
 import { platformKey } from '../infrastructure/installers/installer.js';
 import type { InstallTarget, Installer } from '../infrastructure/installers/installer.js';
@@ -78,7 +78,10 @@ export class InstallationService {
       abi: process.versions.modules,
     });
     const cached = (await this.list()).find((item) => item.key === key);
-    if (cached) return cached;
+    if (cached) {
+      if (cached.state !== 'ready') fail('INSTALLATION_BUSY', '此安装正在删除，请先完成清理。');
+      return cached;
+    }
     let job = this.jobs.get(key);
     if (job?.abort.signal.aborted) fail('INSTALLATION_BUSY', '同目标安装仍在停止中。');
     if (!job) {
@@ -95,6 +98,19 @@ export class InstallationService {
       shared.promise = new Promise<void>((resolve) => setImmediate(resolve)).then(async () => {
         const jobSignal = AbortSignal.any([shared.abort.signal, AbortSignal.timeout(600_000)]);
         const lock = `install:${key}`;
+        const lockHolder = `${process.pid}:${shared.id}`;
+        let jobRecord: InstallationJob = {
+          id: shared.id,
+          revision: 1,
+          createdAt: now(),
+          instanceId: this.operations.instanceId,
+          key,
+          lockHolder,
+          state: 'waiting',
+        };
+        let built: InstallationRecord | undefined;
+        let published = false;
+        let cleanupPending = false;
         let acquired = false;
         const progress = async (step: string) => {
           shared.step = step;
@@ -103,30 +119,44 @@ export class InstallationService {
           );
         };
         try {
-          await this.store.put('installation_job', {
-            id: shared.id,
-            revision: 1,
-            createdAt: now(),
-            instanceId: this.operations.instanceId,
-            key,
-            state: 'running',
-          });
+          await this.store.put('installation_job', jobRecord);
           while (!acquired) {
             jobSignal.throwIfAborted();
             const installed = (await this.list()).find((item) => item.key === key);
-            if (installed) return installed;
+            if (installed) {
+              if (installed.state !== 'ready') fail('INSTALLATION_BUSY', '此安装正在删除。');
+              return installed;
+            }
             try {
-              await this.store.commit({ claims: [{ key: lock, holder: shared.id }] });
+              await this.store.commit({ claims: [{ key: lock, holder: lockHolder }] });
               acquired = true;
             } catch (error) {
               if (!(error instanceof AppError && error.code === 'RESOURCE_CONFLICT')) throw error;
+              await this.store.releaseDeadLock(lock);
               await progress('waiting_install_lock');
               await delay(100, undefined, { signal: jobSignal });
             }
           }
           // 获锁后再检查缓存，等待期间其他实例可能已经完成并发布同目标安装。
           const installed = (await this.list()).find((item) => item.key === key);
-          if (installed) return installed;
+          if (installed) {
+            if (installed.state !== 'ready') fail('INSTALLATION_BUSY', '此安装正在删除。');
+            return installed;
+          }
+          if (
+            (await this.store.list<InstallationJob>('installation_job')).some(
+              (item) =>
+                item.id !== shared.id && item.key === key && item.state === 'cleanup_pending',
+            )
+          )
+            fail('STORAGE_CLEANUP_REQUIRED', '此目标有待清理作业，请先运行 storage cleanup。');
+          jobRecord = {
+            ...jobRecord,
+            revision: 2,
+            state: 'running',
+            paths: this.installer.locations(key, shared.id),
+          };
+          await this.store.put('installation_job', jobRecord);
           const record = await this.installer.install(
             target,
             manifest,
@@ -134,21 +164,71 @@ export class InstallationService {
             key,
             jobSignal,
             progress,
+            shared.id,
           );
-          await this.store.put('installation', record);
+          built = record;
+          const ended: InstallationJob = {
+            ...jobRecord,
+            revision: jobRecord.revision + 1,
+            state: 'ended',
+          };
+          // 安装与作业终态一起发布，避免 ready 产物留下无法完成的崩溃作业。
+          await this.store.commit({
+            checks: [
+              {
+                kind: 'installation_job',
+                id: jobRecord.id,
+                revision: jobRecord.revision,
+                state: 'running',
+              },
+            ],
+            puts: [row('installation', record), row('installation_job', ended)],
+          });
+          published = true;
+          jobRecord = ended;
           return record;
+        } catch (error) {
+          if (built) {
+            // 发布响应异常时重读事实；无法确认数据库状态就保留产物供人工诊断。
+            try {
+              published = !!(await this.store.get<InstallationRecord>('installation', built.id));
+              if (!published) await this.installer.cleanup(key, shared.id);
+            } catch {
+              cleanupPending = true;
+            }
+          }
+          if (jobRecord.paths && !published && !cleanupPending) {
+            for (const path of Object.values(jobRecord.paths)) {
+              if (
+                await lstat(path).then(
+                  () => true,
+                  (error: NodeJS.ErrnoException) => error.code !== 'ENOENT',
+                )
+              )
+                cleanupPending = true;
+            }
+          }
+          throw error;
         } finally {
           shared.finished = true;
-          if (acquired) await this.store.commit({ releases: [{ key: lock, holder: shared.id }] });
-          await this.store.put('installation_job', {
-            id: shared.id,
-            revision: 2,
-            createdAt: now(),
-            instanceId: this.operations.instanceId,
-            key,
-            state: 'ended',
-          });
-          this.jobs.delete(key);
+          try {
+            await this.store.commit({
+              ...(!published
+                ? {
+                    puts: [
+                      row('installation_job', {
+                        ...jobRecord,
+                        revision: jobRecord.revision + 1,
+                        state: cleanupPending ? 'cleanup_pending' : 'ended',
+                      }),
+                    ],
+                  }
+                : {}),
+              releases: acquired ? [{ key: lock, holder: lockHolder }] : [],
+            });
+          } finally {
+            this.jobs.delete(key);
+          }
         }
       });
       void shared.promise.catch(() => {});
@@ -177,31 +257,51 @@ export class InstallationService {
 
   /** 移除与安装共用目标锁，并拒绝删除仍被注册配置或活动 Runtime 引用的产物。 */
   async remove(ctx: Context, args: { installationId: string; idempotencyKey: string }) {
-    const replay = await this.store.replay(idem(ctx, 'installation_remove', args, null));
-    if (replay) return replay;
-    const record = await this.store.get<InstallationRecord>('installation', args.installationId);
-    if (!record) fail('OBJECT_NOT_FOUND', '安装不存在。');
-    const holder = id('remove');
-    const lock = `install:${record.key}`;
-    await this.store.commit({ claims: [{ key: lock, holder }] });
-    try {
-      const result = await this.store.commit({
-        checks: [{ kind: 'installation', id: record.id, revision: record.revision }],
-        absentClaimPrefixes: [`installation:${record.id}:`],
-        deletes: [{ kind: 'installation', id: record.id }],
-        idempotency: idem(ctx, 'installation_remove', args, { removed: true }),
-      });
-      if (!result.replayed) {
-        await rm(record.path, { recursive: true, force: true });
-        await rm(join(this.installer.dataDir, 'tool-cache', record.key), {
-          recursive: true,
-          force: true,
+    // 不同目标复用同一个幂等键时，也必须在任何文件副作用之前完成冲突检查。
+    return this.store.locked(
+      `idempotency:${digest([ctx.principalId, 'installation_remove', args.idempotencyKey])}`,
+      async () => {
+        const replay = await this.store.replay(idem(ctx, 'installation_remove', args, null));
+        if (replay) return replay;
+        const record = await this.store.get<InstallationRecord>(
+          'installation',
+          args.installationId,
+        );
+        if (!record) fail('OBJECT_NOT_FOUND', '安装不存在。');
+        return this.store.locked(`install:${record.key}`, async () => {
+          const replayed = await this.store.replay(idem(ctx, 'installation_remove', args, null));
+          if (replayed) return replayed;
+          const current = await this.store.get<InstallationRecord>('installation', record.id);
+          if (!current) fail('OBJECT_NOT_FOUND', '安装不存在。');
+          const removing: InstallationRecord = {
+            ...current,
+            revision: current.revision + 1,
+            state: 'removing',
+          };
+          await this.store.commit({
+            checks: [{ kind: 'installation', id: current.id, revision: current.revision }],
+            absentClaimPrefixes: [`installation:${current.id}:`],
+            puts: [row('installation', removing)],
+          });
+          // 删除失败保留 removing 记录；重试相同请求不会提前命中成功幂等结果。
+          await this.installer.cleanup(current.key);
+          const result = await this.store.commit({
+            checks: [
+              {
+                kind: 'installation',
+                id: current.id,
+                revision: removing.revision,
+                state: 'removing',
+              },
+            ],
+            absentClaimPrefixes: [`installation:${current.id}:`],
+            deletes: [{ kind: 'installation', id: current.id }],
+            idempotency: idem(ctx, 'installation_remove', args, { removed: true }),
+          });
+          return result.response;
         });
-      }
-      return result.response;
-    } finally {
-      await this.store.commit({ releases: [{ key: lock, holder }] });
-    }
+      },
+    );
   }
 
   /** 先准备目标产物，再用配置 CAS 原子提交版本切换；已有 Runtime 继续使用原启动快照。 */
@@ -251,6 +351,7 @@ export class InstallationService {
               );
         if (
           !install ||
+          install.state !== 'ready' ||
           install.sourceId !== origin.sourceId ||
           install.registryAgentId !== origin.registryAgentId
         )

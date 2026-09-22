@@ -3,6 +3,7 @@ import { errorDetail, AppError } from '../domain/errors.js';
 import type {
   ActivationRecord,
   InstanceRecord,
+  InstallationJob,
   InteractionRecord,
   RuntimeRecord,
   SegmentRecord,
@@ -125,11 +126,19 @@ export async function recover(store: SqliteStore) {
             state: 'cancelled',
           }),
         );
-    for (const job of await store.list<{ id: string; instanceId: string; key: string }>(
-      'installation_job',
-    ))
-      if (job.instanceId === instance.id)
-        releases.push({ key: `install:${job.key}`, holder: job.id });
+    for (const job of await store.list<InstallationJob>('installation_job'))
+      if (job.instanceId === instance.id) {
+        releases.push({ key: `install:${job.key}`, holder: job.lockHolder ?? job.id });
+        if (job.state === 'running' || job.state === 'waiting')
+          puts.push(
+            row('installation_job', {
+              ...job,
+              revision: job.revision + 1,
+              state: job.paths ? 'cleanup_pending' : 'ended',
+            }),
+          );
+      }
+
     // 以实例修订防止多个启动者重复接管；该实例的状态与资源释放一起提交。
     await store.commit({
       checks: [{ kind: 'instance', id: instance.id, revision: instance.revision }],

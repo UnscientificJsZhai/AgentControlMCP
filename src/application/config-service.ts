@@ -15,7 +15,7 @@ export class ConfigService {
 
   constructor(
     readonly store: SqliteStore,
-    readonly dataDir: string,
+    readonly configDir: string,
   ) {}
 
   /** 显式版本读取历史快照，省略版本读取当前配置；运行中的 Runtime 使用自己的快照。 */
@@ -57,7 +57,7 @@ export class ConfigService {
       puts: [row('config', record), { ...row('config_revision', record), id: `${record.id}:1` }],
       checks:
         config.launch.kind === 'installation'
-          ? [{ kind: 'installation', id: config.launch.installationId }]
+          ? [{ kind: 'installation', id: config.launch.installationId, state: 'ready' }]
           : [],
       claims:
         config.launch.kind === 'installation'
@@ -104,7 +104,7 @@ export class ConfigService {
           ? [{ kind: 'operation', id: operation.id, revision: operation.revision }]
           : []),
         ...(config.launch.kind === 'installation'
-          ? [{ kind: 'installation', id: config.launch.installationId }]
+          ? [{ kind: 'installation', id: config.launch.installationId, state: 'ready' }]
           : []),
       ],
       puts: [
@@ -206,7 +206,7 @@ export class ConfigService {
       try {
         // 取得跨实例投影锁后重读最新修订，避免慢导出把较旧的配置写回磁盘。
         record = await this.get(record.id);
-        const dir = join(this.dataDir, 'config', 'agents');
+        const dir = join(this.configDir, 'agents');
         await mkdir(dir, { recursive: true, mode: 0o700 });
         const path = join(dir, `${record.id}.json`);
         const old = await this.store.get<{ digest: string }>('projection', record.id);

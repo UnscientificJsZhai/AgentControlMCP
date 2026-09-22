@@ -12,7 +12,7 @@ void test('AC-010/011/024: 部分更新保留环境引用、多实例 CAS、人�
   assert.deepEqual(agentPatch.parse({ name: '更新名称' }), { name: '更新名称' });
   const h = await harness();
   const store = await SqliteStore.open(join(h.app.dataDir, 'state/state.db'));
-  const other = new ConfigService(store, h.app.dataDir);
+  const other = new ConfigService(store, h.app.paths.configDir);
   try {
     const outcomes = await Promise.allSettled([
       h.app.configs.update(h.alice, {

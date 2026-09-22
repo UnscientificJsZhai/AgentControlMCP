@@ -1,3 +1,4 @@
+import { resolveStoragePaths } from '../../src/infrastructure/storage/paths.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -10,7 +11,7 @@ void test('AC-003/021: 事件跨 9/10/99/100 按整数排序，分页不跳号�
   const dir = await mkdtemp(join(tmpdir(), 'acm-cursor-'));
   const store = await SqliteStore.open(join(dir, 'db'));
   try {
-    const events = new EventService(store, dir, 'fixture-key');
+    const events = new EventService(store, resolveStoragePaths({ dataDir: dir }), 'fixture-key');
     for (let index = 1; index <= 120; index++)
       await store.appendEvent({
         streamId: 'stream',

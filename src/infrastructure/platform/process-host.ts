@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
-import { access, readFile, realpath } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import { AppError, fail } from '../../domain/errors.js';
@@ -17,13 +17,16 @@ export async function which(
           .split(delimiter)
           .flatMap((root) =>
             process.platform === 'win32'
-              ? ['', '.exe', '.cmd'].map((ext) => join(root, command + ext))
+              ? (/\.[a-z0-9]+$/i.test(command) ? [''] : ['.exe', '.com', '.cmd', '']).map((ext) =>
+                  join(root, command + ext),
+                )
               : [join(root, command)],
           );
   for (const candidate of candidates) {
     try {
       await access(candidate, constants.X_OK);
-      return await realpath(candidate);
+      // Python 根据调用路径识别虚拟环境，解析到符号链接目标会错误启动全局环境。
+      return resolve(candidate);
     } catch {
       /* 继续检查下一个 PATH 候选。 */
     }
@@ -33,16 +36,28 @@ export async function which(
   });
 }
 
-export async function executableCommand(command: string, args: string[], env: NodeJS.ProcessEnv) {
+export async function executableCommand(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  platform = process.platform,
+) {
   const executable = await which(command, env);
-  if (process.platform !== 'win32' || !/\.cmd$/i.test(executable)) return { executable, args };
+  if (platform !== 'win32' || !/\.cmd$/i.test(executable)) return { executable, args };
   // 只解析 npm 的已知 shim；绝不将任意 argv 拼接给 cmd.exe。
   const script = await readFile(executable, 'utf8');
-  const match = /%dp0%[\\/]node_modules[\\/]npm[\\/]bin[\\/](npm-cli|npx-cli)\.js/i.exec(script);
+  const match =
+    /(?:%dp0%[\\/]|%~dp0[\\/]?)node_modules[\\/]npm[\\/]bin[\\/](npm-cli|npx-cli)\.js/i.exec(
+      script,
+    );
   if (!match) return fail('CONFIG_INVALID', '无法安全执行 .cmd；请显式指定解释器和脚本参数。');
+  const entry = join(dirname(executable), 'node_modules/npm/bin', `${match[1]!.toLowerCase()}.js`);
+  await access(entry, constants.R_OK).catch(() =>
+    fail('DEPENDENCY_MISSING', 'npm 启动脚本对应的 JS 入口不存在。'),
+  );
   return {
     executable: process.execPath,
-    args: [join(dirname(executable), 'node_modules/npm/bin', `${match[1]}.js`), ...args],
+    args: [entry, ...args],
   };
 }
 

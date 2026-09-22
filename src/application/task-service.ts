@@ -55,7 +55,7 @@ export class TaskService {
       validatePrompt(handle.client.initialize.agentCapabilities ?? {}, args.prompt);
       const settings = this.sessions.runtimes.settings;
       await this.capacityCleanup();
-      const space = await statfs(this.sessions.events.dataDir);
+      const space = await statfs(this.sessions.events.paths.stateDir);
       if (space.bavail * space.bsize < settings.minimumFreeBytes)
         fail('STORAGE_FULL', '磁盘可用空间不足，拒绝接受新任务。');
       if ((await this.capacityUsage()) >= settings.historyMaxBytes)

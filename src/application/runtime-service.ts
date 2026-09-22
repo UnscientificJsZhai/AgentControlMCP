@@ -1,3 +1,4 @@
+import { delimiter } from 'node:path';
 import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import type { ClientCapabilities, InitializeResponse } from '@agentclientprotocol/sdk';
@@ -142,7 +143,8 @@ export class RuntimeService {
       launch.kind === 'installation'
         ? await this.store.get<InstallationRecord>('installation', launch.installationId)
         : null;
-    if (launch.kind === 'installation' && !installation) fail('CONFIG_INVALID', '安装记录不存在。');
+    if (launch.kind === 'installation' && installation?.state !== 'ready')
+      fail('CONFIG_INVALID', '安装记录不存在。');
     const slot = {
       id: runtime.id,
       revision: 1,
@@ -158,7 +160,7 @@ export class RuntimeService {
           id: args.configRevision ? `${config.id}:${config.revision}` : config.id,
           revision: config.revision,
         },
-        ...(installation ? [{ kind: 'installation', id: installation.id }] : []),
+        ...(installation ? [{ kind: 'installation', id: installation.id, state: 'ready' }] : []),
       ],
       puts: [row('runtime', runtime), row('runtime_slot', slot)],
       claims: [
@@ -186,6 +188,9 @@ export class RuntimeService {
     try {
       signal.throwIfAborted();
       const resolved = await resolveEnvironment(config.config.environment, installation?.env);
+      if (installation?.binDir) {
+        resolved.env.PATH = `${installation.binDir}${delimiter}${resolved.env.PATH ?? ''}`;
+      }
       const local = config.config.environment.values.CODEX_PATH;
       if (local) {
         const path = resolved.env.CODEX_PATH;
