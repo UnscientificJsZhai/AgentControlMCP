@@ -74,6 +74,8 @@ export class SessionService {
   }
 
   cancelTask: (ctx: Context, taskId: string) => Promise<unknown> = async () => {};
+  managedServers: (ctx: Context, runtime: RuntimeRecord) => Promise<McpServer[]> = () =>
+    Promise.resolve([]);
 
   constructor(
     readonly store: SqliteStore,
@@ -86,6 +88,10 @@ export class SessionService {
     const session = await this.store.get<SessionRecord>('session', sessionId);
     if (!session) return fail('SESSION_NOT_FOUND', '会话不存在。');
     access(ctx, session, level);
+    if (level !== 'read' && session.managedAgentId && ctx.managedAgentId !== session.managedAgentId)
+      fail('AGENT_MANAGED', '此会话由协作调度器管理，请使用 Agent 工具。', {
+        agentId: session.managedAgentId,
+      });
     return session;
   }
 
@@ -210,6 +216,7 @@ export class SessionService {
             args.additionalDirectories ?? [],
             args.mcpServers ?? runtime.snapshot.mcpServers,
           );
+          params.mcpServers.push(...(await this.managedServers(ctx, runtime)));
           const sessionId = id('ses');
           const activationId = id('act');
           session = {
@@ -238,6 +245,7 @@ export class SessionService {
             modes: null,
             commands: [],
             controlVersion: 0,
+            ...(ctx.managedAgentId ? { managedAgentId: ctx.managedAgentId } : {}),
           };
           const activation: ActivationRecord = {
             id: activationId,
@@ -804,6 +812,7 @@ export class SessionService {
             )),
             sessionId: original.downstreamSessionId,
           };
+          params.mcpServers.push(...(await this.managedServers(ctx, runtime)));
           const response =
             method === 'load'
               ? await handle.client.request(

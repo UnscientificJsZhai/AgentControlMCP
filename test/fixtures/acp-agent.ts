@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 type RpcId = string | number;
 
@@ -24,6 +26,35 @@ interface PendingRequest {
 interface FixtureSession {
   sessionId: string;
   cwd: string;
+}
+const bridges = new Map<string, Client>();
+
+async function connectBridge(sessionId: string, params: Record<string, unknown>) {
+  if (process.env.FIXTURE_BRIDGE !== '1') return;
+  assert.ok(Array.isArray(params.mcpServers));
+  const config = (params.mcpServers as unknown[])
+    .map(object)
+    .find((s) => s.name === 'agent_collaboration');
+  assert.ok(config);
+  const client = new Client({ name: 'independent-acp-bridge-fixture', version: '1' });
+  await client.connect(
+    new StdioClientTransport({
+      command: string(config.command),
+      args: config.args as string[],
+      stderr: 'pipe',
+    }),
+  );
+  const tools = await client.listTools();
+  assert.equal(tools.tools.length, 8);
+  bridges.set(sessionId, client);
+  await audit({ bridgeConnected: sessionId, tools: tools.tools.map((t) => t.name) });
+}
+
+async function bridgeCall(client: Client, name: string, args: Record<string, unknown>) {
+  const response = await client.callTool({ name, arguments: args });
+  const envelope = response.structuredContent as { ok: boolean; data: Record<string, unknown> };
+  assert.equal(envelope.ok, true, JSON.stringify(response));
+  return envelope.data;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -164,6 +195,7 @@ async function handle(message: RpcMessage) {
       {
         const id = randomUUID();
         await save(id, string(params.cwd));
+        await connectBridge(id, params);
         result = { sessionId: id, ...state() };
       }
       break;
@@ -180,6 +212,7 @@ async function handle(message: RpcMessage) {
         ) as unknown,
       );
       sessions.set(sessionId, { sessionId: string(saved.sessionId), cwd: string(saved.cwd) });
+      await connectBridge(sessionId, params);
       if (message.method === 'session/load')
         for (let index = 0; index < 4; index++)
           update(sessionId, {
@@ -197,6 +230,7 @@ async function handle(message: RpcMessage) {
       break;
     case 'session/close':
       prompts.get(string(params.sessionId))?.abort();
+      await bridges.get(string(params.sessionId))?.close();
       break;
     case 'session/set_mode':
       if (process.env.FIXTURE_CONTROL_DELAY) await delay(Number(process.env.FIXTURE_CONTROL_DELAY));
@@ -232,6 +266,36 @@ async function handle(message: RpcMessage) {
         .map((block) => string(block.text))
         .join('');
       const cwd = sessions.get(sessionId)?.cwd ?? process.cwd();
+      if (text.startsWith('bridge-spawn-')) {
+        const bridge = bridges.get(sessionId);
+        assert.ok(bridge);
+        const child = await bridgeCall(bridge, 'spawn_agent', {
+          requestId: 'child',
+          taskName: 'child',
+          message: text.startsWith('bridge-spawn-parent')
+            ? 'bridge-spawn-child explicit facts'
+            : 'grandchild explicit facts',
+        });
+        await audit({ childAgent: child.agentId });
+        await bridgeCall(bridge, 'send_message', {
+          requestId: 'root-message',
+          target: '/root',
+          message: 'fixture member message',
+        });
+        const received = await bridgeCall(bridge, 'wait_agent', { timeoutMs: 10000 });
+        assert.ok(Array.isArray(received.messages) && received.messages.length > 0);
+      }
+      if (text.startsWith('prompt-error')) {
+        update(sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'first' },
+        });
+        update(sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'second' },
+        });
+        throw new Error('fixture prompt error');
+      }
       // 孙进程忽略 SIGTERM，用于验证受管进程组（Windows Job）内的后代最终被强制回收。
       if (text.includes('tree')) {
         const child = spawn(
@@ -364,9 +428,17 @@ async function handle(message: RpcMessage) {
           content: { type: 'text', text: '大'.repeat(50000) },
         });
       if (text.includes('crash')) process.exit(21);
-      await delay(text.includes('slow') || text.includes('tree') ? 60000 : 20, undefined, {
-        signal: abort.signal,
-      }).catch(() => {});
+      await delay(
+        text.includes('slow') || text.includes('tree')
+          ? 60000
+          : text.startsWith('brief')
+            ? 300
+            : 20,
+        undefined,
+        {
+          signal: abort.signal,
+        },
+      ).catch(() => {});
       prompts.delete(sessionId);
       result = { stopReason: abort.signal.aborted ? 'cancelled' : 'end_turn' };
       break;

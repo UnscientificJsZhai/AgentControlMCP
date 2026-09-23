@@ -8,6 +8,7 @@ import { agentConfig, agentPatch } from '../../domain/schemas.js';
 import { id } from '../../domain/ids.js';
 import { fail } from '../../domain/errors.js';
 import { createTools, invoke } from '../mcp/tools.js';
+import { createCollaborationTools } from '../mcp/collaboration-tools.js';
 import { connectorDocument, SettingsService } from '../../application/settings-service.js';
 import { RecoveryAdminService } from '../../application/recovery-admin-service.js';
 import { absolutePath, text } from '../../domain/schemas.js';
@@ -24,6 +25,11 @@ export async function adminCommand(
   presentationAuthorized = false,
 ): Promise<unknown> {
   const args = z.record(z.string(), z.unknown()).parse(input);
+  if (name === 'interaction_respond' && presentationAuthorized && ctx.admin) {
+    const interaction = await app.interactions.get(ctx, text.parse(args.interactionId), true);
+    const runtime = await app.runtimes.get(ctx, interaction.runtimeId);
+    if (runtime.managedAgentId) ctx = { ...ctx, managedAgentId: runtime.managedAgentId };
+  }
   if (name === '_recovery_inspect') return new RecoveryAdminService(app).inspect();
   if (name === '_recovery_resolve')
     return new RecoveryAdminService(app).resolve(
@@ -155,5 +161,5 @@ export async function adminCommand(
     }, 50);
     return { stopping: true };
   }
-  return invoke(app, createTools(app), ctx, name, args);
+  return invoke(app, [...createTools(app), ...createCollaborationTools(app)], ctx, name, args);
 }

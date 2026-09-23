@@ -2,6 +2,9 @@
 export { Container } from './bootstrap/container.js';
 export { createTools, invoke } from './transport/mcp/tools.js';
 export { createMcpTools } from './transport/mcp/catalog.js';
+export { createCollaborationTools } from './transport/mcp/collaboration-tools.js';
+export type { Toolset } from './transport/mcp/catalog.js';
+export type { AgentState, AgentView } from './domain/collaboration.js';
 export { startHttp, startStdio } from './transport/mcp/serve.js';
 export { AppError } from './domain/errors.js';
 

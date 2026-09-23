@@ -31,6 +31,21 @@ function decode(row: Record<string, unknown> | undefined): unknown {
   return row ? (JSON.parse(row.data as string) as unknown) : null;
 }
 
+function logicalUsage() {
+  const records = db
+    .prepare('SELECT coalesce(sum(length(CAST(data AS BLOB))),0) AS bytes FROM records')
+    .get() as { bytes: number };
+  const events = db.prepare('SELECT coalesce(sum(bytes),0) AS bytes FROM events').get() as {
+    bytes: number;
+  };
+  const contents = db
+    .prepare(
+      "SELECT coalesce(sum(size),0) AS bytes FROM (SELECT json_extract(data,'$.contentId'), max(json_extract(data,'$.bytes')) AS size FROM records WHERE kind='content_ref' GROUP BY json_extract(data,'$.contentId'))",
+    )
+    .get() as { bytes: number };
+  return records.bytes + events.bytes + contents.bytes;
+}
+
 /** 先取得 SQLite 写锁再检查业务条件，保证不同服务实例不能同时通过同一资源的准入。 */
 function transaction(input: Transaction) {
   db.exec('BEGIN IMMEDIATE');
@@ -89,9 +104,32 @@ function transaction(input: Transaction) {
       )
         fail('RESOURCE_CONFLICT', '资源已被占用。', { key: claim.key, holder: previous.holder });
     }
+    if (input.maxLogicalBytes !== undefined) {
+      let projected = logicalUsage();
+      for (const row of input.puts ?? []) {
+        const previous = db
+          .prepare('SELECT length(CAST(data AS BLOB)) AS bytes FROM records WHERE kind=? AND id=?')
+          .get(row.kind, row.id) as { bytes: number } | undefined;
+        if (row.ifAbsent && previous) continue;
+        projected += Buffer.byteLength(JSON.stringify(row.data)) - (previous?.bytes ?? 0);
+      }
+      if (projected > input.maxLogicalBytes) fail('STORAGE_FULL', '存储容量已满，未接受协作请求。');
+    }
+    for (const alias of input.idempotencyAliases ?? []) {
+      const previous = db
+        .prepare('SELECT digest FROM idempotency WHERE principal=? AND method=? AND key=?')
+        .get(alias.principal, alias.method, alias.key);
+      if (previous)
+        fail(
+          previous.digest === alias.digest ? 'REVISION_CONFLICT' : 'IDEMPOTENCY_CONFLICT',
+          '上层请求已受理，请重读原请求结果。',
+        );
+    }
     for (const row of input.puts ?? [])
       db.prepare(
-        'INSERT INTO records VALUES (?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET revision=excluded.revision,data=excluded.data',
+        row.ifAbsent
+          ? 'INSERT INTO records VALUES (?,?,?,?) ON CONFLICT(kind,id) DO NOTHING'
+          : 'INSERT INTO records VALUES (?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET revision=excluded.revision,data=excluded.data',
       ).run(row.kind, row.id, row.revision, JSON.stringify(row.data));
     for (const row of input.deletes ?? [])
       db.prepare('DELETE FROM records WHERE kind=? AND id=?').run(row.kind, row.id);
@@ -99,13 +137,13 @@ function transaction(input: Transaction) {
       db.prepare('DELETE FROM claims WHERE key=? AND holder=?').run(claim.key, claim.holder);
     for (const claim of input.claims ?? [])
       db.prepare('INSERT OR IGNORE INTO claims VALUES (?,?)').run(claim.key, claim.holder);
-    if (idem)
+    for (const entry of [...(idem ? [idem] : []), ...(input.idempotencyAliases ?? [])])
       db.prepare('INSERT INTO idempotency VALUES (?,?,?,?,?)').run(
-        idem.principal,
-        idem.method,
-        idem.key,
-        idem.digest,
-        JSON.stringify(idem.response),
+        entry.principal,
+        entry.method,
+        entry.key,
+        entry.digest,
+        JSON.stringify(entry.response),
       );
     db.exec('COMMIT');
     return { replayed: false, response: idem?.response };
@@ -325,9 +363,13 @@ parentPort?.on('message', (request: RpcRequest) => {
           .get();
         break;
       case 'close':
-        db.close();
         response.value = null;
+        db.close();
         break;
+      case 'logicalUsage': {
+        response.value = { bytes: logicalUsage() };
+        break;
+      }
       default:
         fail('STORAGE_UNAVAILABLE', '未知存储请求。');
     }

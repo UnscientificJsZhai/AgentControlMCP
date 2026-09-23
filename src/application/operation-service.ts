@@ -6,9 +6,13 @@ import type { Context, WorkRecord } from '../domain/models.js';
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import { idem, Serial } from './common.js';
+import type { Row, Transaction } from '../infrastructure/storage/protocol.js';
 
 /** 为安装、认证、恢复等长操作提供统一的持久化状态、幂等受理和实例内取消句柄。 */
 export class OperationService {
+  acceptRecords: (ctx: Context, work: WorkRecord) => Promise<Transaction> = () =>
+    Promise.resolve({});
+  terminalRecords: (work: WorkRecord) => Promise<Row[]> = () => Promise.resolve([]);
   private readonly active = new Map<string, { abort: AbortController; done: Promise<void> }>();
   readonly serial = new Serial();
   authorize: (ctx: Context, record: WorkRecord, control: boolean) => Promise<void> = (
@@ -51,11 +55,23 @@ export class OperationService {
       state: 'accepted',
       commitState: 'pending',
       ...target,
+      ...(type === 'session_create' && ctx.collaborationIntent
+        ? {
+            collaborationSetup: {
+              teamId: ctx.collaborationIntent.teamId,
+              agentId: ctx.collaborationIntent.agentId,
+              intentId: ctx.collaborationIntent.intentId,
+            },
+          }
+        : {}),
     };
+    const additional = await this.acceptRecords(ctx, record);
     const response = { operationId: record.id, state: 'accepted' };
     const committed = await this.store.commit({
-      puts: [row('operation', record)],
+      checks: additional.checks ?? [],
+      puts: [row('operation', record), ...(additional.puts ?? [])],
       idempotency: idem(ctx, type, args, response),
+      ...(additional.idempotency ? { idempotencyAliases: [additional.idempotency] } : {}),
     });
     const accepted = committed.response as typeof response;
     if (committed.replayed) {
@@ -107,7 +123,10 @@ export class OperationService {
       const next = { ...record, ...patch, revision: record.revision + 1 };
       await this.store.commit({
         checks: [{ kind: 'operation', id: record.id, revision: record.revision }],
-        puts: [row('operation', next)],
+        puts: [
+          row('operation', next),
+          ...(terminalStates.has(next.state) ? await this.terminalRecords(next) : []),
+        ],
       });
       await this.store.appendEvent({
         streamId: operationId,

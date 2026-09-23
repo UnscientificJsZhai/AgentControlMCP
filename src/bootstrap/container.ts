@@ -40,6 +40,9 @@ import { readText, writeText, checkedPath } from '../infrastructure/platform/fil
 import { recover } from '../application/recovery-service.js';
 import { fingerprint } from '../adapters/local/codex.js';
 import { SettingsService } from '../application/settings-service.js';
+import { CollaborationController } from '../application/collaboration/controller.js';
+import { completionRows } from '../application/collaboration/store.js';
+import { CollaborationIpc } from '../transport/collaboration/ipc.js';
 
 export const defaultDataDir = () => resolveStoragePaths().dataDir;
 
@@ -63,6 +66,8 @@ export class Container {
   readonly local;
   readonly history;
   readonly storage;
+  readonly collaboration;
+  readonly collaborationIpc;
   get dataDir() {
     return this.paths.dataDir;
   }
@@ -111,6 +116,17 @@ export class Container {
     );
     this.local = new LocalPlanService(this.installations);
     this.history = new HistoryService(this.events, this.operations, this.runtimes);
+    this.collaboration = new CollaborationController(this);
+    this.collaborationIpc = new CollaborationIpc(this);
+    this.tasks.acceptRecords = (ctx, task) => this.collaboration.acceptTask(ctx, task);
+    this.tasks.terminalRecords = completionRows;
+    this.operations.acceptRecords = (ctx, work) => this.collaboration.acceptOperation(ctx, work);
+    this.operations.terminalRecords = (work) => this.collaboration.operationTerminalRecords(work);
+    this.sessions.managedServers = (ctx, runtime) => this.collaborationIpc.bind(ctx, runtime);
+    this.collaboration.revokeBridge = (agentId) => this.collaborationIpc.revoke(agentId);
+    this.interactions.inheritedPolicies = (session) =>
+      this.collaboration.inheritedPolicies(session);
+    this.history.protectedWork = (work) => this.collaboration.storage.protectedWork(work);
     const nonce = randomBytes(32).toString('hex');
     const endpoint =
       process.platform === 'win32'
@@ -156,10 +172,10 @@ export class Container {
           this.attachedChannels.has(this.admin.principalId))) ||
       (channel === 'mcp_native' && ctx.nativeInteraction === true);
     // 先解除等待中的回调和终端，再结束任务与会话，最后由 Runtime 服务释放占用。
-    this.runtimes.onClose = async (runtimeId) => {
+    this.runtimes.onClose = async (runtimeId, outputComplete) => {
       await this.interactions.cancel(runtimeId);
       await this.terminals.close(runtimeId);
-      await this.tasks.exited(runtimeId);
+      await this.tasks.exited(runtimeId, outputComplete);
       await this.sessions.ended(runtimeId);
     };
     this.runtimes.ports = (runtimeId) => ({
@@ -236,6 +252,7 @@ export class Container {
           container.mode === 'http' ? [{ key: 'http_service', holder: container.instanceId }] : [],
       });
       await container.registry.initialize();
+      container.collaboration.start();
       await new SettingsService(store, paths.configDir).export();
       // 心跳供本地诊断使用，自动恢复另以进程存活检查为准；unref 避免定时器维持进程存活。
       container.timer = setInterval(() => {
@@ -367,6 +384,7 @@ export class Container {
   /** 停止新维护工作，收敛下游任务，再写入实例终态；存储必须最后关闭。 */
   private async shutdown() {
     clearInterval(this.timer);
+    await this.collaboration.shutdown();
     for (const task of await this.store.list<WorkRecord>('task'))
       if (
         task.instanceId === this.instanceId &&
@@ -377,6 +395,7 @@ export class Container {
     await this.installations.close();
     await this.operations.close();
     await this.tasks.close();
+    await this.collaborationIpc.close();
     await this.onShutdown();
     if (this.paths.runtimeDir) await rm(this.paths.runtimeDir, { recursive: true, force: true });
     const instance = await this.store.get<InstanceRecord>('instance', this.instanceId);

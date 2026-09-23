@@ -2,6 +2,10 @@ import { z } from 'zod';
 import type { Container } from '../../bootstrap/container.js';
 import { createTools } from './tools.js';
 import type { ToolDefinition } from './tools.js';
+import { createCollaborationTools } from './collaboration-tools.js';
+
+export const toolsetSchema = z.enum(['collaboration', 'legacy', 'management']);
+export type Toolset = z.infer<typeof toolsetSchema>;
 
 // 高频会话工作流直接公开；低频管理操作通过分类入口提供，减少客户端默认加载的工具数量。
 const directNames = new Set([
@@ -108,7 +112,11 @@ function managementToolName(tool: ToolDefinition) {
  * 从内部完整操作目录派生公开 MCP 目录；CLI 仍可使用原操作名。
  * 管理入口先限制 action 分类，再交给原工具 Schema 校验 arguments，避免弱化参数约束。
  */
-export function createMcpTools(app: Container): ToolDefinition[] {
+export function createMcpTools(
+  app: Container,
+  toolset: Toolset = 'collaboration',
+): ToolDefinition[] {
+  if (toolset === 'collaboration') return createCollaborationTools(app);
   const operations = createTools(app);
   const management = operations.filter((tool) => managementNames.has(tool.name));
   const describeSchema = z.strictObject({ action: z.enum(management.map((tool) => tool.name)) });
@@ -168,5 +176,9 @@ export function createMcpTools(app: Container): ToolDefinition[] {
       },
     };
   });
-  return [...operations.filter((tool) => directNames.has(tool.name)), describe, ...gateways];
+  return [
+    ...(toolset === 'legacy' ? operations.filter((tool) => directNames.has(tool.name)) : []),
+    describe,
+    ...gateways,
+  ];
 }

@@ -7,9 +7,10 @@ import { hostHeaderValidation, toNodeHandler } from '@modelcontextprotocol/node'
 import type { Container } from '../../bootstrap/container.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import { createServer } from './server.js';
+import type { Toolset } from './catalog.js';
 
 /** stdio 以稳定客户端标识归属数据；输入结束意味着该服务实例结束，需回收下游资源。 */
-export function startStdio(app: Container, clientId: string) {
+export function startStdio(app: Container, clientId: string, toolset: Toolset = 'collaboration') {
   if (!/^[\w.-]{1,128}$/.test(clientId)) fail('CONFIG_INVALID', 'stdio 需要稳定客户端标识。');
   const ctx = {
     principalId: `stdio:${clientId}`,
@@ -19,7 +20,7 @@ export function startStdio(app: Container, clientId: string) {
   const transport = new StdioServerTransport(process.stdin, process.stdout, {
     maxBufferSize: 17 * 1024 ** 2,
   });
-  const handle = serveStdio((request) => createServer(app, ctx, request), {
+  const handle = serveStdio((request) => createServer(app, ctx, request, toolset), {
     transport,
     legacy: 'serve',
     onerror: () => {},
@@ -39,6 +40,7 @@ export function startStdio(app: Container, clientId: string) {
 }
 
 export interface HttpOptions {
+  toolset?: Toolset;
   host: string;
   port: number;
   noAuth?: boolean;
@@ -64,7 +66,8 @@ export async function startHttp(
       ? app.identities.registerAnonymous(headers.get('x-agent-client-id') ?? '')
       : app.identities.authenticate(headers.get('authorization') ?? undefined);
   const handler = createMcpHandler(
-    async (request) => createServer(app, await identity(request.requestInfo!.headers), request),
+    async (request) =>
+      createServer(app, await identity(request.requestInfo!.headers), request, options.toolset),
     {
       legacy: 'stateless',
       maxSubscriptions: 64,

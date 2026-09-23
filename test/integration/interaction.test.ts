@@ -27,7 +27,12 @@ void test(
       );
     });
     try {
-      const { url } = await startHttp(h.app, { host: '127.0.0.1', port: 0, noAuth: true });
+      const { url } = await startHttp(h.app, {
+        host: '127.0.0.1',
+        port: 0,
+        noAuth: true,
+        toolset: 'legacy',
+      });
       await client.connect(
         new StreamableHTTPClientTransport(new URL(url), {
           requestInit: { headers: { 'x-agent-client-id': 'alice' } },

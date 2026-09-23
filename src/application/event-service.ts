@@ -1,6 +1,6 @@
 import type { StoragePaths } from '../infrastructure/storage/paths.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { bytes, digest, id, now } from '../domain/ids.js';
 import { fail } from '../domain/errors.js';
@@ -242,5 +242,40 @@ export class EventService {
       data: chunk.toString('base64'),
       eof: offset + chunk.length >= buffer.length,
     };
+  }
+
+  /** 回收已确认不再需要的协作内容单元，其他历史或邮箱引用继续保活同一内容文件。 */
+  async releaseContentUnits(unitIds: Set<string>) {
+    const units = await this.store.list<{
+      id: string;
+      unitId: string;
+      objectId: string;
+      contentId: string;
+    }>('content_unit');
+    const contentIds = new Set(
+      units.filter((unit) => unitIds.has(unit.unitId)).map((unit) => unit.contentId),
+    );
+    for (const contentId of contentIds)
+      await this.store.locked(`content:${contentId}`, async () => {
+        const current = (await this.store.list<(typeof units)[number]>('content_unit')).filter(
+          (unit) => unit.contentId === contentId,
+        );
+        const removed = current.filter((unit) => unitIds.has(unit.unitId));
+        const kept = current.filter((unit) => !unitIds.has(unit.unitId));
+        await this.store.commit({
+          deletes: [
+            ...removed.map((unit) => ({ kind: 'content_unit', id: unit.id })),
+            ...removed
+              .filter((unit) => !kept.some((other) => other.objectId === unit.objectId))
+              .map((unit) => ({ kind: 'content_ref', id: `${unit.objectId}:${contentId}` })),
+          ],
+        });
+        if (
+          !(await this.store.list<{ contentId: string }>('content_ref')).some(
+            (ref) => ref.contentId === contentId,
+          )
+        )
+          await rm(join(this.paths.contentDir, contentId), { force: true });
+      });
   }
 }

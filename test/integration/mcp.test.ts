@@ -37,6 +37,8 @@ for (const era of ['modern', 'legacy'] as const)
                 resolve('dist/cli/entry.js'),
                 'serve',
                 'stdio',
+                '--toolset',
+                'legacy',
                 '--data-dir',
                 join(dir, 'data'),
                 '--client-id',
@@ -48,7 +50,12 @@ for (const era of ['modern', 'legacy'] as const)
             else await legacy.connect(new LegacyStdio(options));
           } else {
             app = await Container.create({ dataDir: join(dir, 'data'), mode: 'http' });
-            const { url } = await startHttp(app, { host: '127.0.0.1', port: 0, noAuth: true });
+            const { url } = await startHttp(app, {
+              host: '127.0.0.1',
+              port: 0,
+              noAuth: true,
+              toolset: 'legacy',
+            });
             const options = { requestInit: { headers: { 'x-agent-client-id': 'acceptance' } } };
             if (era === 'modern')
               await modern.connect(new StreamableHTTPClientTransport(new URL(url), options));
@@ -81,7 +88,7 @@ for (const era of ['modern', 'legacy'] as const)
           }
           const list = await client.listTools();
           assert.equal(list.tools.length, 30);
-          assert.deepEqual(list.tools, createMcpTools({} as Container).map(describeTool));
+          assert.deepEqual(list.tools, createMcpTools({} as Container, 'legacy').map(describeTool));
           assert.ok(Buffer.byteLength(JSON.stringify(list.tools)) <= 30 * 1024);
           await assert.rejects(client.callTool({ name: 'agent_register', arguments: {} }));
           const call = async (name: string, args: Record<string, unknown> = {}) => {

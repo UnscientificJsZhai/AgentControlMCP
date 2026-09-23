@@ -19,7 +19,12 @@ export class AuthService {
   ) {}
 
   async target(ctx: Context, target: RuntimeTarget): Promise<RuntimeRecord> {
-    if (target.runtimeId) return this.runtimes.get(ctx, target.runtimeId, true);
+    if (target.runtimeId) {
+      const runtime = await this.runtimes.get(ctx, target.runtimeId, true);
+      if (runtime.managedAgentId && ctx.managedAgentId !== runtime.managedAgentId)
+        fail('AGENT_MANAGED', '托管成员认证请使用 respond_agent。');
+      return runtime;
+    }
     const session = await this.runtimes.store.get<SessionRecord>('session', target.sessionId!);
     if (!session) return fail('SESSION_NOT_FOUND', '会话不存在。');
     return this.runtimes.get(ctx, session.runtimeId, true);

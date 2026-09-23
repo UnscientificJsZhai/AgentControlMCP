@@ -155,6 +155,8 @@ void test(
         resolve('dist/cli/entry.js'),
         'serve',
         'stdio',
+        '--toolset',
+        'legacy',
         '--data-dir',
         dataDir,
         '--client-id',

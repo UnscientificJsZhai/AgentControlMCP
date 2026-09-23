@@ -53,6 +53,7 @@ interface CleanupPlan {
 
 /** 按当前对象归属查询历史，并通过带版本和摘要的清理方案回收已结束且无活动引用的数据。 */
 export class HistoryService {
+  protectedWork: (work: WorkRecord) => Promise<boolean> = () => Promise.resolve(false);
   constructor(
     readonly events: EventService,
     readonly operations: OperationService,
@@ -126,6 +127,7 @@ export class HistoryService {
   /** 任务和操作须已终结；事件段还需封口，且所属会话无任务、交互或生命周期操作占用。 */
   private async eligible(kind: Candidate['kind'], item: HistoryItem): Promise<boolean> {
     if (item.purged) return false;
+    if (kind !== 'segment' && (await this.protectedWork(item as WorkRecord))) return false;
     if (kind !== 'segment') return terminalStates.has((item as WorkRecord).state);
     const segment = item as SegmentRecord;
     if (segment.state !== 'sealed') return false;

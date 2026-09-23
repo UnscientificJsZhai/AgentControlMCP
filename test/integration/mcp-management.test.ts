@@ -8,7 +8,7 @@ import { invoke } from '../../src/transport/mcp/tools.js';
 void test('管理入口保留原操作的参数校验、幂等、修订和单层返回', async () => {
   const h = await harness();
   try {
-    const definitions = createMcpTools(h.app);
+    const definitions = createMcpTools(h.app, 'legacy');
     const request = (name: string, args: unknown) =>
       invoke(h.app, definitions, h.alice, name, args);
     const config = (await h.app.configs.get(h.registered.configId)).config;
@@ -87,7 +87,7 @@ void test('管理入口保留原操作的参数校验、幂等、修订和单层
 void test('破坏性入口保留引用保护及历史清理计划校验', { timeout: 20_000 }, async () => {
   const h = await harness();
   try {
-    const definitions = createMcpTools(h.app);
+    const definitions = createMcpTools(h.app, 'legacy');
     const request = (action: string, args: unknown) =>
       invoke(h.app, definitions, h.alice, 'management_destructive', { action, arguments: args });
     const session = await h.session();
@@ -190,10 +190,16 @@ void test(
           transferred = true;
         }
       };
-      const result = await invoke(h.app, createMcpTools(h.app), h.alice, 'management_read', {
-        action: 'history_get',
-        arguments: { kind: 'task', id: task.taskId },
-      });
+      const result = await invoke(
+        h.app,
+        createMcpTools(h.app, 'legacy'),
+        h.alice,
+        'management_read',
+        {
+          action: 'history_get',
+          arguments: { kind: 'task', id: task.taskId },
+        },
+      );
       if (transferred) {
         assert.equal(result.ok, false, '身份检查期间已移交的私有历史不得返回');
       } else {
@@ -247,7 +253,7 @@ for (const action of ['history_get', 'history_list'] as const)
           return data;
         };
       }
-      const definitions = createMcpTools(h.app);
+      const definitions = createMcpTools(h.app, 'legacy');
       const pending = invoke(h.app, definitions, h.alice, 'management_read', {
         action,
         arguments: action === 'history_get' ? { kind: 'task', id: task.taskId } : { kind: 'task' },

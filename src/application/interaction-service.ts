@@ -12,6 +12,7 @@ import type {
   WorkRecord,
 } from '../domain/models.js';
 import type { OperationDescription } from '../domain/permission-policy.js';
+import type { PermissionPolicy } from '../domain/schemas.js';
 import { decide } from '../domain/permission-policy.js';
 import { checkedPath, inside } from '../infrastructure/platform/file-callbacks.js';
 import { redact } from '../infrastructure/platform/environment.js';
@@ -29,6 +30,9 @@ export type PermissionDecision =
  * 决策先落盘再交付，实例退出或连接代次变化后不能把旧答复发送给新连接。
  */
 export class InteractionService {
+  inheritedPolicies: (
+    session: SessionRecord,
+  ) => Promise<{ policy: PermissionPolicy; roots: string[] }[]> = () => Promise.resolve([]);
   private readonly pending = new Map<
     string,
     { resolve: (value: unknown) => void; timer?: NodeJS.Timeout }
@@ -52,7 +56,7 @@ export class InteractionService {
       const session = await this.store.get<SessionRecord>('session', record.sessionId);
       if (!session) return fail('SESSION_NOT_FOUND', '会话不存在。');
       access(ctx, session, control ? 'control' : 'read');
-    } else await this.runtimes.get(ctx, record.runtimeId, control);
+    } else await this.runtimes.get(ctx, record.runtimeId);
     return record;
   }
 
@@ -112,9 +116,31 @@ export class InteractionService {
         })),
       ),
     };
-    return decide(policy, { ...description, paths }, (path, ruleRoots) =>
+    const own = decide(policy, { ...description, paths }, (path, ruleRoots) =>
       (ruleRoots.length ? ruleRoots : roots).some((root) => inside(root, path)),
     );
+    const inherited = await this.inheritedPolicies(session);
+    const results = await Promise.all(
+      inherited.map(async ({ policy: parentPolicy, roots: parentRoots }) => {
+        const normalized = {
+          ...parentPolicy,
+          rules: await Promise.all(
+            parentPolicy.rules.map(async (rule) => ({
+              ...rule,
+              roots: await Promise.all(rule.roots.map((root) => realpath(root).catch(() => root))),
+            })),
+          ),
+        };
+        return decide(normalized, { ...description, paths }, (path, ruleRoots) =>
+          (ruleRoots.length ? ruleRoots : parentRoots).some((root) => inside(root, path)),
+        );
+      }),
+    );
+    return [own, ...results].includes('deny')
+      ? 'deny'
+      : [own, ...results].every((r) => r === 'allow_once')
+        ? 'allow_once'
+        : 'ask';
   }
 
   /** 只从明确的 read 类型和路径推导自动授权；其他描述保留原始 ACP 选项交给用户。 */
@@ -293,6 +319,28 @@ export class InteractionService {
       response = { outcome: { outcome: 'selected', optionId } };
     } else fail('INVALID_PERMISSION_OPTION', '答复类型与交互不匹配。');
     return this.respond(ctx, record, args, response, 'permission_respond');
+  }
+
+  /** 委托者只能批准自身预先获准的操作；不能把自己的 ask 通过子成员变成 allow。 */
+  async mayDelegateApproval(
+    runtimeId: string,
+    record: InteractionRecord,
+    decision: PermissionDecision,
+  ) {
+    if (decision.kind === 'cancel' || (decision.kind === 'host' && !decision.allow)) return true;
+    let description: OperationDescription | null = null;
+    if (decision.kind === 'acp_option') {
+      const option = (record.request.options as { optionId: string; kind: string }[]).find(
+        (o) => o.optionId === decision.optionId,
+      );
+      if (option?.kind.startsWith('reject')) return true;
+      if (option?.kind !== 'allow_once') return false;
+      const call = record.request.toolCall as { kind: string; locations?: { path: string }[] };
+      if (call.kind === 'read' && call.locations?.length)
+        description = { operation: 'read', paths: call.locations.map((l) => l.path) };
+    } else if (record.type === 'host_permission')
+      description = record.request as unknown as OperationDescription;
+    return (await this.policy(runtimeId, description)) === 'allow_once';
   }
 
   /** 由真实交互通道签发一次性审阅收据，绑定身份、交互和完整响应内容。 */

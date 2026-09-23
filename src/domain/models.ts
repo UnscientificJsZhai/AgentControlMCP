@@ -10,6 +10,17 @@ export interface Context {
   /** 当前请求的等待生命周期；后台任务是否取消由相应应用服务决定。 */
   signal?: AbortSignal;
   nativeInteraction?: boolean;
+  /** 仅专用 Bridge 验证后建立的调用身份，绝不从工具参数接收。 */
+  collaborationMember?: { teamId: string; agentId: string };
+  /** 调度器内部通行证，旧会话入口不能自行控制托管会话。 */
+  managedAgentId?: string;
+  collaborationIntent?: { teamId: string; agentId: string; intentId: string; mailAfter: string };
+  /** 恢复受理的内部事务绑定，不来自公开工具参数。 */
+  collaborationRestore?: {
+    recoveryId: string;
+    queuedIntentIds: string[];
+    request: { principal: string; key: string; digest: string };
+  };
 }
 
 /** 持久化对象的公共字段；revision 用于比较并交换，避免覆盖并发更新。 */
@@ -42,6 +53,8 @@ export const terminalStates = new Set<RunState>([
 
 /** task 表示一次 prompt，operation 表示安装、认证等可在请求返回后继续执行的用例。 */
 export interface WorkRecord extends Entity {
+  collaboration?: { teamId: string; agentId: string; intentId: string };
+  collaborationSetup?: { teamId: string; agentId: string; intentId: string };
   kind: 'task' | 'operation';
   ownerId: string;
   instanceId: string;
@@ -52,6 +65,7 @@ export interface WorkRecord extends Entity {
   result?: unknown;
   error?: ErrorDetail;
   endedAt?: string;
+  outputComplete?: boolean;
   /** 派发结果与运行状态独立；unknown 不表示未执行，恢复时不得据此自动重试。 */
   dispatchOutcome?: string;
   step?: string;
@@ -61,6 +75,7 @@ export interface WorkRecord extends Entity {
 
 /** 一次 ACP 连接的持久化描述；进程、流和已解析的秘密只保存在内存句柄中。 */
 export interface RuntimeRecord extends Entity {
+  managedAgentId?: string;
   instanceId: string;
   ownerId: string;
   configId: string;
@@ -80,6 +95,7 @@ export interface RuntimeRecord extends Entity {
 
 /** 连接器的逻辑会话，可在显式恢复后关联新的 Runtime 和 activation。 */
 export interface SessionRecord extends Entity {
+  managedAgentId?: string;
   ownerId: string;
   grants: Record<string, 'read' | 'control'>;
   instanceId: string;

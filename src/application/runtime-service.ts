@@ -37,6 +37,7 @@ export interface RuntimeHandle {
 
 /** 管理 ACP 进程从 starting、prepared、bound 到 closed 的生命周期及资源占用。 */
 export class RuntimeService {
+  private readonly closing = new Map<string, Promise<void>>();
   readonly live = new Map<string, RuntimeHandle>();
   /** 认证、绑定和关闭期间的实例内互斥标记，同时阻止 prepared TTL 清理。 */
   readonly lifecycle = new Set<string>();
@@ -45,7 +46,7 @@ export class RuntimeService {
   channelAvailable: (ctx: Context, channel: string) => boolean = (_ctx, channel) =>
     channel === 'none';
   validateBinding: (configId: string, path: string) => Promise<void> = async () => {};
-  onClose: (runtimeId: string) => Promise<void> = async () => {};
+  onClose: (runtimeId: string, outputComplete?: boolean) => Promise<void> = async () => {};
 
   constructor(
     readonly store: SqliteStore,
@@ -64,6 +65,8 @@ export class RuntimeService {
       access(ctx, session, control ? 'control' : 'read');
     } else if (!ctx.admin && record.ownerId !== ctx.principalId)
       fail('OBJECT_NOT_FOUND', 'Runtime 不存在或不可见。');
+    if (control && record.managedAgentId && ctx.managedAgentId !== record.managedAgentId)
+      fail('AGENT_MANAGED', '此 Runtime 由协作调度器管理，请使用 Agent 工具。');
     return record;
   }
 
@@ -124,6 +127,7 @@ export class RuntimeService {
     if (!this.channelAvailable(ctx, channel))
       fail('INTERACTION_CHANNEL_UNAVAILABLE', '此入口没有所请求的真实交互通道。');
     const runtime: RuntimeRecord = {
+      ...(ctx.managedAgentId ? { managedAgentId: ctx.managedAgentId } : {}),
       id: id('run'),
       revision: 1,
       createdAt: now(),
@@ -259,14 +263,29 @@ export class RuntimeService {
     };
   }
 
-  /** 先移除活动句柄并终止进程，再通知关联服务收尾；关闭记录保留供诊断和恢复。 */
-  async closeNow(runtimeId: string) {
+  /** 终止连接并等待尾部通知持久化后释放句柄；关闭记录保留供诊断和恢复。 */
+  closeNow(runtimeId: string) {
+    const previous = this.closing.get(runtimeId);
+    if (previous) return previous;
+    const closing = this.closeRuntime(runtimeId).finally(() => this.closing.delete(runtimeId));
+    this.closing.set(runtimeId, closing);
+    return closing;
+  }
+
+  private async closeRuntime(runtimeId: string) {
     const handle = this.live.get(runtimeId);
-    this.live.delete(runtimeId);
     if (handle) await handle.client.close();
+    let outputComplete = !!handle;
+    if (handle)
+      try {
+        await handle.client.barrier();
+      } catch {
+        outputComplete = false;
+      }
+    this.live.delete(runtimeId);
     const record = await this.store.get<RuntimeRecord>('runtime', runtimeId);
     if (!record || record.state === 'closed') return;
-    await this.onClose(runtimeId);
+    await this.onClose(runtimeId, outputComplete);
     const launch = record.snapshot.launch;
     await this.store.commit({
       puts: [

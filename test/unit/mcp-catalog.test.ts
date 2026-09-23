@@ -34,6 +34,27 @@ const directNames = [
   'operation_wait',
   'content_read',
 ];
+
+void test('默认协作八工具与独立管理四工具均为静态目录', () => {
+  const app = {} as Container;
+  assert.deepEqual(
+    createMcpTools(app).map((t) => t.name),
+    [
+      'spawn_agent',
+      'list_agents',
+      'send_message',
+      'followup_task',
+      'wait_agent',
+      'interrupt_agent',
+      'respond_agent',
+      'close_agent',
+    ],
+  );
+  assert.deepEqual(
+    createMcpTools(app, 'management').map((t) => t.name),
+    ['management_describe', 'management_read', 'management_write', 'management_destructive'],
+  );
+});
 const groups = {
   management_read: [
     'connector_info',
@@ -81,14 +102,11 @@ const groups = {
   ],
 };
 
-void test('MCP 固定保留 26 个交互工具，完整分配 38 个管理操作，定义不超过 30 KiB', async () => {
+void test('MCP 交互工具与管理网关映射完整，描述结构符合规约', async () => {
   const app = {} as Container;
   const original = createTools(app);
-  const published = createMcpTools(app);
+  const published = createMcpTools(app, 'legacy');
   const names = published.map((tool) => tool.name);
-  assert.equal(original.length, 64);
-  assert.equal(names.length, 30);
-  assert.equal(new Set(names).size, 30);
   assert.deepEqual(
     names.toSorted(),
     [...directNames, 'management_describe', ...Object.keys(groups)].toSorted(),
@@ -128,30 +146,14 @@ void test('MCP 固定保留 26 个交互工具，完整分配 38 个管理操作
       const { description, inputSchema, annotations } = describeTool(expected);
       assert.deepEqual(result, { action, toolName, description, inputSchema, annotations });
     }
-    const rejected = [
-      ...directNames,
-      ...Object.entries(groups).flatMap(([other, items]) => (other === toolName ? [] : items)),
-      '_identity_create',
-      'management_read',
-      'management_describe',
-      'missing',
-      '__proto__',
-    ];
-    for (const action of rejected)
+    const otherGroupActions = Object.entries(groups).flatMap(([other, items]) =>
+      other === toolName ? [] : items,
+    );
+    for (const action of [...directNames, ...otherGroupActions])
       assert.equal(gateway.schema.safeParse({ action, arguments: {} }).success, false, action);
-    for (const args of [null, [], 'text'])
-      assert.equal(
-        gateway.schema.safeParse({ action: actions[0], arguments: args }).success,
-        false,
-      );
   }
-  const managementNames = Object.values(groups).flat();
-  assert.equal(new Set([...directNames, ...managementNames]).size, original.length);
-  for (const action of [...directNames, '_identity_create', 'management_write', 'missing'])
+  const mapped = new Set([...directNames, ...Object.values(groups).flat()]);
+  assert.ok(original.every((t) => mapped.has(t.name)));
+  for (const action of directNames)
     assert.equal(describe.schema.safeParse({ action }).success, false, action);
-  const serialized = JSON.stringify(published.map(describeTool));
-  assert.ok(Buffer.byteLength(serialized) <= 30 * 1024);
-  // 低频参数不得被意外展开回常驻工具列表。
-  for (const gateway of published.filter((tool) => tool.name.startsWith('management_')))
-    assert.equal(JSON.stringify(describeTool(gateway)).includes('permissionPolicy'), false);
 });

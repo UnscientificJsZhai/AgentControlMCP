@@ -93,6 +93,10 @@ export const agentPatch = agentConfig
   .strict();
 /** 实例启动时读取的连接器设置；资源上限同时参与事务准入和后台清理。 */
 export const settingsSchema = z.strictObject({
+  collaborationDefaultProfile: text.optional(),
+  collaborationMaxAgents: z.number().int().min(1).max(32).default(8),
+  collaborationMaxDepth: z.number().int().min(1).max(16).default(4),
+  collaborationMaxQueuedTasks: z.number().int().min(1).max(128).default(16),
   maxRuntimes: z.number().int().min(1).max(32).default(8),
   maxGlobalRuntimes: z.number().int().min(1).max(128).default(32),
   maxTasks: z.number().int().min(1).max(32).default(8),

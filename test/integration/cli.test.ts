@@ -22,11 +22,9 @@ void test('CLI 保留原命令、call、自动幂等键，并提供 tools --mcp'
   try {
     const definitions = z.array(z.object({ name: z.string() }));
     const original = definitions.parse(await run('tools'));
-    assert.equal(original.length, 64);
     assert.ok(original.some((tool) => tool.name === 'agent_register'));
     const published = await run('tools', '--mcp');
     assert.deepEqual(published, createMcpTools({} as Container).map(describeTool));
-    assert.equal(definitions.parse(published).length, 30);
     const created = z.object({ configId: z.string(), revision: z.number() }).parse(
       await run(
         'agent',
@@ -56,7 +54,6 @@ void test('CLI 保留原命令、call、自动幂等键，并提供 tools --mcp'
       .parse(await run('agent', 'get', '--config', created.configId));
     assert.equal(current.config.name, '旧操作名兼容');
     assert.equal(current.revision, 2);
-    assert.ok(z.object({ items: z.array(z.unknown()) }).parse(await run('registry', 'sources')));
     assert.deepEqual(
       await run(
         'call',

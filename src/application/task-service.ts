@@ -10,9 +10,13 @@ import { row } from '../infrastructure/storage/sqlite-store.js';
 import { validatePrompt } from '../infrastructure/acp/capability-gate.js';
 import type { SessionService } from './session-service.js';
 import { idem } from './common.js';
+import type { Transaction, Row } from '../infrastructure/storage/protocol.js';
 
 /** 将一次 prompt 转为持久化任务；请求返回任务 ID 后，下游执行由本实例继续持有。 */
 export class TaskService {
+  acceptRecords: (ctx: Context, task: WorkRecord) => Promise<Transaction> = () =>
+    Promise.resolve({});
+  terminalRecords: (task: WorkRecord) => Row[] = () => [];
   private readonly active = new Map<string, Promise<void>>();
   cancelInteractions: (runtimeId: string, taskId?: string) => Promise<void> = async () => {};
   capacityCleanup: () => Promise<void> = async () => {};
@@ -72,11 +76,24 @@ export class TaskService {
         commitState: 'committed',
         sessionId: session.id,
         runtimeId: record.id,
+        ...(ctx.collaborationIntent
+          ? {
+              collaboration: {
+                teamId: ctx.collaborationIntent.teamId,
+                agentId: ctx.collaborationIntent.agentId,
+                intentId: ctx.collaborationIntent.intentId,
+              },
+            }
+          : {}),
       };
+      const acceptedRecords = await this.acceptRecords(ctx, task);
       const response = { taskId: task.id, state: 'accepted', revision: 1 };
       // 任务、会话占用和幂等响应必须同事务保存，重试才不会创建第二次 prompt。
       await this.store.commit({
-        checks: [{ kind: 'session', id: session.id, revision: session.revision }],
+        checks: [
+          { kind: 'session', id: session.id, revision: session.revision },
+          ...(acceptedRecords.checks ?? []),
+        ],
         puts: [
           row('task', task),
           row('task_slot', {
@@ -86,6 +103,7 @@ export class TaskService {
             instanceId: task.instanceId,
           }),
           row('session', { ...session, revision: session.revision + 1, activeTaskId: task.id }),
+          ...(acceptedRecords.puts ?? []),
         ],
         claims: [{ key: `prompt:${session.id}`, holder: task.id }],
         limits: [
@@ -127,6 +145,12 @@ export class TaskService {
             dispatchOutcome: 'confirmed',
           });
         } catch (error) {
+          let outputComplete = true;
+          try {
+            await handle.client.barrier();
+          } catch {
+            outputComplete = false;
+          }
           const latest = await this.store.get<WorkRecord>('task', task.id);
           if (latest && !terminalStates.has(latest.state))
             await this.finish(task.id, {
@@ -137,6 +161,7 @@ export class TaskService {
                     ? 'interrupted'
                     : 'failed',
               error: errorDetail(error),
+              outputComplete,
             });
         } finally {
           await this.cancelInteractions(record.id, task.id);
@@ -181,7 +206,7 @@ export class TaskService {
           { kind: 'task', id: taskId, revision: task.revision },
           { kind: 'session', id: session.id, revision: session.revision },
         ],
-        puts: [row('task', next), row('session', updatedSession)],
+        puts: [row('task', next), row('session', updatedSession), ...this.terminalRecords(next)],
         releases: [{ key: `prompt:${session.id}`, holder: taskId }],
         deletes: [{ kind: 'task_slot', id: taskId }],
       });
@@ -229,21 +254,19 @@ export class TaskService {
         const session = await this.sessions.get(ctx, task.sessionId!, 'control');
         const next = { ...session, revision: session.revision + 1 };
         delete next.activeTaskId;
+        const ended: WorkRecord = {
+          ...current,
+          state: 'cancelled',
+          endedAt: now(),
+          dispatchOutcome: 'not_sent',
+          revision: current.revision + 1,
+        };
         await this.store.commit({
           checks: [
             { kind: 'task', id: taskId, revision: current.revision },
             { kind: 'session', id: session.id, revision: session.revision },
           ],
-          puts: [
-            row('task', {
-              ...current,
-              state: 'cancelled',
-              endedAt: now(),
-              dispatchOutcome: 'not_sent',
-              revision: current.revision + 1,
-            }),
-            row('session', next),
-          ],
+          puts: [row('task', ended), row('session', next), ...this.terminalRecords(ended)],
           releases: [{ key: `prompt:${session.id}`, holder: taskId }],
           deletes: [{ kind: 'task_slot', id: taskId }],
         });
@@ -278,12 +301,13 @@ export class TaskService {
   }
 
   /** 进程退出只能证明执行被中断，不能把尚未确认的副作用改写为未发送。 */
-  async exited(runtimeId: string) {
+  async exited(runtimeId: string, outputComplete = false) {
     for (const task of await this.store.list<WorkRecord>('task'))
       if (task.runtimeId === runtimeId && !terminalStates.has(task.state))
         await this.finish(task.id, {
           state: task.state === 'cancelling' ? 'cancelled' : 'interrupted',
           error: errorDetail(new AppError('DOWNSTREAM_EXITED', '下游进程已退出。')),
+          outputComplete,
         });
   }
 

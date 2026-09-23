@@ -11,8 +11,10 @@ import type { Container } from '../../bootstrap/container.js';
 import type { Context } from '../../domain/models.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import { digest } from '../../domain/ids.js';
-import { invoke } from './tools.js';
+import { invoke, createTools } from './tools.js';
 import { createMcpTools, toolAnnotations } from './catalog.js';
+import type { Toolset } from './catalog.js';
+import { collaborationSchemas } from './collaboration-tools.js';
 
 // 重入状态按 Container 保存，支持现代 HTTP 下一次请求创建新 server 后继续同一交互。
 const presentations = new WeakMap<
@@ -26,7 +28,12 @@ const result = (data: Record<string, unknown>): CallToolResult => ({
 });
 
 /** 绑定已认证身份与实际协议代际，注册相同业务工具及按对象授权的大内容资源。 */
-export function createServer(app: Container, identity: Context, transport: McpRequestContext) {
+export function createServer(
+  app: Container,
+  identity: Context,
+  transport: McpRequestContext,
+  toolset: Toolset = 'collaboration',
+) {
   const server = new McpServer(
     { name: 'agent-control-mcp', version: '1.0.0' },
     {
@@ -34,7 +41,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
       capabilities: { tools: {}, resources: {} },
     },
   );
-  const definitions = createMcpTools(app);
+  const definitions = createMcpTools(app, toolset);
   if (!presentations.has(app)) presentations.set(app, new Map());
 
   async function present(ctx: Context, input: unknown, request: ServerContext) {
@@ -154,6 +161,47 @@ export function createServer(app: Container, identity: Context, transport: McpRe
         try {
           await app.identities.check(ctx);
           if (definition.name === 'interaction_present') return await present(ctx, args, request);
+          if (definition.name === 'respond_agent') {
+            const input = collaborationSchemas.respond_agent.parse(args);
+            if (input.action === 'present') {
+              const replay = await app.collaboration.replayResponse(ctx, input);
+              if (replay) return result({ ok: true, data: replay });
+              const info = await app.collaboration.presentation(ctx, input);
+              const presented = await present(
+                info.context,
+                { interactionId: input.interactionId },
+                request,
+              );
+              // inputRequired 交给协议层；只有真实返回的答案才提交原交互服务。
+              const content = (
+                'structuredContent' in presented ? presented.structuredContent : undefined
+              ) as Record<string, unknown> | undefined;
+              if (content?.ok === true) {
+                const answer = content.data as {
+                  action: 'accept' | 'decline' | 'cancel';
+                  content?: Record<string, unknown>;
+                  presentationReceipt?: string;
+                };
+                return result({
+                  ok: true,
+                  data: await app.collaboration.respond(
+                    ctx,
+                    {
+                      requestId: input.requestId,
+                      target: input.target,
+                      action: 'reply',
+                      interactionId: input.interactionId,
+                      answer: answer.action,
+                      content: answer.content,
+                      presentationReceipt: answer.presentationReceipt,
+                    },
+                    input,
+                  ),
+                });
+              }
+              return presented;
+            }
+          }
           return result(await invoke(app, definitions, ctx, definition.name, args));
         } catch (error) {
           return result({ ok: false, error: errorDetail(error) });
@@ -176,7 +224,7 @@ export function createServer(app: Container, identity: Context, transport: McpRe
         : objectId.startsWith('op_')
           ? 'operation'
           : 'session';
-      const response = await invoke(app, definitions, identity, 'content_read', {
+      const response = await invoke(app, createTools(app), identity, 'content_read', {
         objectType,
         objectId,
         contentId,

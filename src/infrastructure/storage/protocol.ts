@@ -4,6 +4,8 @@ export interface Row {
   id: string;
   revision: number;
   data: unknown;
+  /** 不覆盖首次终态事实，允许正常收尾与崩溃恢复安全竞争。 */
+  ifAbsent?: boolean;
 }
 
 /** 写入前置条件：absent 要求对象不存在，否则要求存在并按需比较 revision。 */
@@ -28,6 +30,7 @@ export interface Idempotency {
  * claims 是持久化互斥占用；释放必须匹配 holder，不能释放其他执行者后来取得的资源。
  */
 export interface Transaction {
+  maxLogicalBytes?: number;
   checks?: Check[];
   puts?: Row[];
   deletes?: { kind: string; id: string }[];
@@ -35,6 +38,8 @@ export interface Transaction {
   releases?: { key: string; holder: string }[];
   absentClaimPrefixes?: string[];
   idempotency?: Idempotency;
+  /** 与主受理记录一同写入的上层响应；已存在时禁止创建第二个底层操作。 */
+  idempotencyAliases?: Idempotency[];
   limits?: { kind: string; path: string; value: string; max: number }[];
 }
 

@@ -14,6 +14,8 @@ import { terminalStates } from '../domain/models.js';
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import type { Row } from '../infrastructure/storage/protocol.js';
+import { completionRows } from './collaboration/store.js';
+import type { ManagedAgentRecord } from '../domain/collaboration.js';
 
 /** 只有 ESRCH 视为已退出；权限错误或其他不确定情况按仍存活处理，避免错误抢占资源。 */
 export function isAlive(pid: number) {
@@ -43,26 +45,49 @@ export async function recover(store: SqliteStore) {
     for (const kind of ['task', 'operation'] as const)
       for (const record of await store.list<WorkRecord>(kind))
         if (record.instanceId === instance.id && !terminalStates.has(record.state)) {
-          puts.push(
-            row(kind, {
-              ...record,
-              revision: record.revision + 1,
-              state: 'interrupted',
-              endedAt: now(),
-              error: errorDetail(
-                new AppError(
-                  'DISPATCH_OUTCOME_UNKNOWN',
-                  '所属连接器已退出；未确认完成，不自动重放。',
-                ),
+          const ended: WorkRecord = {
+            ...record,
+            revision: record.revision + 1,
+            state: 'interrupted',
+            endedAt: now(),
+            outputComplete: false,
+            error: errorDetail(
+              new AppError(
+                'DISPATCH_OUTCOME_UNKNOWN',
+                '所属连接器已退出；未确认完成，不自动重放。',
               ),
-            }),
-          );
+            ),
+          };
+          puts.push(row(kind, ended), ...completionRows(ended));
           if (kind === 'task') {
             deletes.push({ kind: 'task_slot', id: record.id });
             releases.push({ key: `prompt:${record.sessionId!}`, holder: record.id });
           }
         }
     const runtimeIds = new Set<string>();
+    const teams = new Set(
+      (await store.list<{ id: string; instanceId: string }>('collab_team'))
+        .filter((team) => team.instanceId === instance.id)
+        .map((team) => team.id),
+    );
+    for (const agent of await store.list<ManagedAgentRecord>('collab_agent')) {
+      if (!teams.has(agent.teamId) || agent.lifecycle === 'closed') continue;
+      const operation = agent.operationId
+        ? await store.get<WorkRecord>('operation', agent.operationId)
+        : null;
+      const rest = { ...agent };
+      delete rest.operationId;
+      delete rest.operationKind;
+      puts.push(
+        row('collab_agent', {
+          ...rest,
+          lifecycle: 'paused',
+          revision: agent.revision + 1,
+          ...(operation?.sessionId ? { sessionId: operation.sessionId } : {}),
+          ...(operation?.runtimeId ? { runtimeId: operation.runtimeId } : {}),
+        }),
+      );
+    }
     for (const runtime of await store.list<RuntimeRecord>('runtime'))
       if (runtime.instanceId === instance.id && runtime.state !== 'closed') {
         runtimeIds.add(runtime.id);

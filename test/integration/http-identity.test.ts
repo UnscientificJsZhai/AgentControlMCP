@@ -14,7 +14,7 @@ void test(
     const h = await harness();
     const clients: Client[] = [];
     try {
-      const { url } = await startHttp(h.app, { host: '127.0.0.1', port: 0 });
+      const { url } = await startHttp(h.app, { host: '127.0.0.1', port: 0, toolset: 'legacy' });
       const a = await h.app.identities.create('A');
       const b = await h.app.identities.create('B');
       const connect = async (token: string) => {
