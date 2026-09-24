@@ -3,6 +3,18 @@ import type { Container } from '../../bootstrap/container.js';
 import { createTools } from './tools.js';
 import type { ToolDefinition } from './tools.js';
 import { createCollaborationTools } from './collaboration-tools.js';
+import { createSetupTools, setupToolNames } from './setup-tools.js';
+import type { AgentToolPhase } from '../../application/agent-availability-service.js';
+
+/** 静态契约与运行目录分离，CLI 可离线输出全部定义。 */
+export function toolsForPhase(definitions: ToolDefinition[], phase: AgentToolPhase) {
+  return definitions.filter(
+    (tool) =>
+      setupToolNames.has(tool.name) ||
+      phase === 'ready' ||
+      (phase === 'recovery' && tool.name !== 'spawn_agent'),
+  );
+}
 
 export const toolsetSchema = z.enum(['collaboration', 'legacy', 'management']);
 export type Toolset = z.infer<typeof toolsetSchema>;
@@ -116,7 +128,8 @@ export function createMcpTools(
   app: Container,
   toolset: Toolset = 'collaboration',
 ): ToolDefinition[] {
-  if (toolset === 'collaboration') return createCollaborationTools(app);
+  if (toolset === 'collaboration')
+    return [...createSetupTools(app), ...createCollaborationTools(app)];
   const operations = createTools(app);
   const management = operations.filter((tool) => managementNames.has(tool.name));
   const describeSchema = z.strictObject({ action: z.enum(management.map((tool) => tool.name)) });

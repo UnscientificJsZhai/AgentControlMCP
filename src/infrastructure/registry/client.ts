@@ -234,7 +234,7 @@ export class RegistryClient {
             'registry_snapshot',
             snapshotId ?? source.snapshotId!,
           )
-        : await this.refresh(sourceId);
+        : await this.store.locked(`registry-initialize:${sourceId}`, () => this.refresh(sourceId));
     if (!snapshot || snapshot.sourceId !== sourceId) fail('OBJECT_NOT_FOUND', '来源快照不存在。');
     const agent = snapshot.agents.find((agent) => agent.id === registryAgentId);
     if (!agent) fail('OBJECT_NOT_FOUND', '来源没有此 Agent。');

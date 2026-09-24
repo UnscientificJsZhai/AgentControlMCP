@@ -1,6 +1,6 @@
 import { digest, id, now } from '../domain/ids.js';
-import { fail } from '../domain/errors.js';
-import type { Context } from '../domain/models.js';
+import { AppError, errorDetail, fail } from '../domain/errors.js';
+import type { Context, WorkRecord } from '../domain/models.js';
 import type { AgentConfig } from '../domain/schemas.js';
 import { agentConfig } from '../domain/schemas.js';
 import { fingerprint, scanCodex } from '../adapters/local/codex.js';
@@ -8,6 +8,7 @@ import type { LocalCandidate } from '../adapters/local/codex.js';
 import type { InstallationService } from './installation-service.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import { idem } from './common.js';
+import { operationUpdateEvent } from './operation-service.js';
 
 type Target =
   | { kind: 'new'; config: Omit<AgentConfig, 'origin' | 'launch'> }
@@ -32,6 +33,8 @@ interface Plan {
 
 /** 为复用宿主 Codex 生成可审阅方案，明确绑定程序指纹、Adapter 快照及配置变更。 */
 export class LocalPlanService {
+  validateConfig: (config: AgentConfig, configId?: string) => Promise<void> = async () => {};
+  onChange: () => Promise<void> = async () => {};
   constructor(readonly installations: InstallationService) {}
 
   async scan(paths?: string[]) {
@@ -115,6 +118,8 @@ export class LocalPlanService {
       before: existing?.config ?? null,
       after: config,
       adapter: entry,
+      installationRequired: true,
+      guidance: '应用此方案可能安装所选 codex-acp 适配器；必须先获得用户对此安装目标的明确授权。',
     };
   }
 
@@ -128,6 +133,14 @@ export class LocalPlanService {
       idempotencyKey: string;
     },
   ) {
+    const replay = await this.installations.store.replay(
+      idem(ctx, 'local_agent_apply', args, null),
+    );
+    if (replay) {
+      const accepted = replay as { operationId: string; state: string };
+      await this.installations.operations.get(ctx, accepted.operationId);
+      return accepted;
+    }
     const plan = await this.installations.store.get<Plan>('local_plan', args.planId);
     if (!plan || (plan.ownerId !== ctx.principalId && !ctx.admin))
       fail('OBJECT_NOT_FOUND', '方案不存在。');
@@ -160,81 +173,101 @@ export class LocalPlanService {
           operationId,
           signal,
         );
-        signal.throwIfAborted();
-        // 安装可能耗时较长，提交前再次检查本地文件，避免使用确认后已经变化的候选。
-        if ((await fingerprint(plan.candidate.path)) !== plan.candidate.fingerprint)
-          fail('PLAN_CHANGED', '安装期间本地文件变化。');
-        const store = this.installations.store;
-        const previous =
-          plan.target.kind === 'existing'
-            ? await this.installations.configs.get(plan.target.configId)
-            : null;
-        const record = {
-          id: previous?.id ?? id('cfg'),
-          revision: (previous?.revision ?? 0) + 1,
-          createdAt: previous?.createdAt ?? now(),
-          config: {
-            ...plan.config,
-            launch: { kind: 'installation' as const, installationId: installation.id },
-          },
-        };
-        const operation = await this.installations.operations.get(ctx, operationId);
-        if (operation.state === 'cancelling') fail('CANCELLED', '方案应用已取消。');
-        await store.commit({
-          checks: [
-            { kind: 'operation', id: operationId, revision: operation.revision },
-            { kind: 'installation', id: installation.id },
-            ...(plan.target.kind === 'existing'
-              ? [
-                  {
-                    kind: 'config',
-                    id: plan.target.configId,
-                    revision: plan.target.expectedRevision,
-                  },
-                ]
-              : []),
-          ],
-          puts: [
-            row('config', record),
-            { ...row('config_revision', record), id: `${record.id}:${record.revision}` },
-            row('local_binding', {
-              id: record.id,
-              revision: record.revision,
-              createdAt: now(),
-              candidate: plan.candidate,
-            }),
-            row('operation', {
-              ...operation,
-              revision: operation.revision + 1,
-              commitState: 'committed',
-            }),
-          ],
-          claims: [
-            { key: `installation:${installation.id}:config:${record.id}`, holder: record.id },
-          ],
-          releases:
-            previous?.config.launch.kind === 'installation'
-              ? [
-                  {
-                    key: `installation:${previous.config.launch.installationId}:config:${record.id}`,
-                    holder: record.id,
-                  },
-                ]
-              : [],
-          idempotency: idem(
-            ctx,
-            'local_plan_commit',
-            { idempotencyKey: operationId },
-            { configId: record.id },
-          ),
-        });
-        await this.installations.configs.project(record);
-        return {
-          configId: record.id,
-          revision: record.revision,
-          installationId: installation.id,
-          localBinding: plan.candidate,
-        };
+        try {
+          signal.throwIfAborted();
+          // 安装可能耗时较长，提交前再次检查本地文件，避免使用确认后已经变化的候选。
+          if ((await fingerprint(plan.candidate.path)) !== plan.candidate.fingerprint)
+            fail('PLAN_CHANGED', '安装期间本地文件变化。');
+          const store = this.installations.store;
+          const previous =
+            plan.target.kind === 'existing'
+              ? await this.installations.configs.get(plan.target.configId)
+              : null;
+          const record = {
+            id: previous?.id ?? id('cfg'),
+            revision: (previous?.revision ?? 0) + 1,
+            createdAt: previous?.createdAt ?? now(),
+            config: {
+              ...plan.config,
+              launch: { kind: 'installation' as const, installationId: installation.id },
+            },
+          };
+          // 本次方案已复核新指纹；不能再套用即将被替换的旧 local_binding。
+          await this.installations.configs.validate(record.config);
+          await this.validateConfig(record.config);
+          const result = {
+            configId: record.id,
+            revision: record.revision,
+            installationId: installation.id,
+            localBinding: plan.candidate,
+          };
+          const operation = await this.installations.operations.get(ctx, operationId);
+          if (operation.state === 'cancelling') fail('CANCELLED', '方案应用已取消。');
+          const completed: WorkRecord = {
+            ...operation,
+            revision: operation.revision + 1,
+            commitState: 'committed',
+            state: 'completed',
+            result,
+            endedAt: now(),
+          };
+          await store.commit({
+            checks: [
+              { kind: 'operation', id: operationId, revision: operation.revision },
+              { kind: 'installation', id: installation.id, state: 'ready' },
+              ...(plan.target.kind === 'existing'
+                ? [
+                    {
+                      kind: 'config',
+                      id: plan.target.configId,
+                      revision: plan.target.expectedRevision,
+                    },
+                  ]
+                : []),
+            ],
+            puts: [
+              row('config', record),
+              { ...row('config_revision', record), id: `${record.id}:${record.revision}` },
+              row('local_binding', {
+                id: record.id,
+                revision: record.revision,
+                createdAt: now(),
+                candidate: plan.candidate,
+              }),
+              row('operation', completed),
+            ],
+            events: [operationUpdateEvent(completed)],
+            claims: [
+              { key: `installation:${installation.id}:config:${record.id}`, holder: record.id },
+            ],
+            releases:
+              previous?.config.launch.kind === 'installation'
+                ? [
+                    {
+                      key: `installation:${previous.config.launch.installationId}:config:${record.id}`,
+                      holder: record.id,
+                    },
+                  ]
+                : [],
+            idempotency: idem(
+              ctx,
+              'local_plan_commit',
+              { idempotencyKey: operationId },
+              { configId: record.id },
+            ),
+          });
+          await this.onChange();
+          await this.installations.configs.project(record);
+          return result;
+        } catch (error) {
+          const detail = errorDetail(error);
+          throw new AppError(
+            detail.code,
+            detail.message,
+            { ...detail.details, installationId: installation.id },
+            '安装产物已保留。请修正配置并重新生成复用方案，或显式注册此 installationId。',
+          );
+        }
       },
     );
   }

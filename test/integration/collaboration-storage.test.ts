@@ -10,10 +10,7 @@ import { harness, until } from '../helpers/harness.js';
 import { completionRows } from '../../src/application/collaboration/store.js';
 import type { WorkRecord } from '../../src/domain/models.js';
 import type { Transaction } from '../../src/infrastructure/storage/protocol.js';
-import type {
-  CompletionRecord,
-  MessageRecord,
-} from '../../src/domain/collaboration.js';
+import type { CompletionRecord, MessageRecord } from '../../src/domain/collaboration.js';
 
 void test('恢复受理原子保存公开响应，失败可重试且不同请求不能重复恢复', async (t) => {
   const h = await harness();

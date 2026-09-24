@@ -25,6 +25,17 @@ export interface Idempotency {
   response: unknown;
 }
 
+/** 复用现有事件表的写入参数；业务事务可以同时保存记录与对应事件。 */
+export interface EventInput {
+  streamId: string;
+  taskId?: string;
+  segmentId?: string;
+  activationId?: string;
+  kind: string;
+  payload: unknown;
+  projection?: Record<string, unknown>;
+}
+
 /**
  * 一个不可分割的业务提交：前置检查、容量限制、资源占用、对象写入和幂等记录共同生效。
  * claims 是持久化互斥占用；释放必须匹配 holder，不能释放其他执行者后来取得的资源。
@@ -33,6 +44,7 @@ export interface Transaction {
   maxLogicalBytes?: number;
   checks?: Check[];
   puts?: Row[];
+  events?: EventInput[];
   deletes?: { kind: string; id: string }[];
   claims?: { key: string; holder: string }[];
   releases?: { key: string; holder: string }[];

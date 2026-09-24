@@ -40,7 +40,7 @@ const waitFields = {
   timeoutMs: z.number().int().min(0).max(30_000).default(10_000),
 };
 const distribution = z.enum(['binary', 'npx', 'uvx']);
-const installFields = {
+export const installFields = {
   sourceId: text,
   registryAgentId: text,
   targetVersion: text,
@@ -309,7 +309,7 @@ export function createTools(app: Container): ToolDefinition[] {
   );
   add(
     'agent_install',
-    '获取固定版本 Agent；立即返回自己的 operationId。',
+    '仅在用户明确指定安装此 Agent 后获取固定版本；立即返回自己的 operationId。不因空环境或启动失败自行安装。',
     obj({ ...installFields, ...write }),
     (ctx, args) => app.installations.install(ctx, args),
   );
@@ -324,7 +324,7 @@ export function createTools(app: Container): ToolDefinition[] {
   );
   add(
     'agent_upgrade',
-    '安装成功后 CAS 切换此配置；已有会话保持原启动快照。',
+    '仅在用户明确指定升级目标后安装并 CAS 切换此配置；已有会话保持原启动快照。',
     obj({
       configId: text,
       sourceSnapshotId: text,
@@ -337,7 +337,7 @@ export function createTools(app: Container): ToolDefinition[] {
   );
   add(
     'agent_rollback',
-    '显式切换到保留的安装或可核验的分发快照。',
+    '显式切换到保留的安装或可核验的分发快照；快照分支可能安装，必须先取得用户对目标的明确授权。',
     obj({
       configId: text,
       target: z.union([
@@ -421,7 +421,7 @@ export function createTools(app: Container): ToolDefinition[] {
   );
   add(
     'local_agent_apply',
-    '应用已明确选择的方案摘要；文件或目标变化则拒绝，不自动回退。',
+    '此操作可能下载并安装 ACP 适配器，须由用户明确授权该安装目标后应用方案摘要；发现本地 Codex 不代表授权安装。文件或目标变化则拒绝。',
     obj({
       planId: text,
       planDigest: text,

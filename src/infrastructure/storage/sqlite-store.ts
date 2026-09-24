@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { id } from '../../domain/ids.js';
 import { AppError } from '../../domain/errors.js';
 import type { Entity, EventRecord } from '../../domain/models.js';
-import type { CommitResult, RpcResponse, Transaction } from './protocol.js';
+import type { CommitResult, EventInput, RpcResponse, Transaction } from './protocol.js';
 
 export const row = <T extends Entity>(kind: string, entity: T) => ({
   kind,
@@ -152,15 +152,7 @@ export class SqliteStore {
     await this.commit({ puts: [row(kind, entity)] });
   }
 
-  appendEvent(args: {
-    streamId: string;
-    taskId?: string;
-    segmentId?: string;
-    activationId?: string;
-    kind: string;
-    payload: unknown;
-    projection?: Record<string, unknown>;
-  }) {
+  appendEvent(args: EventInput) {
     return this.call<string>('eventAppend', args);
   }
 

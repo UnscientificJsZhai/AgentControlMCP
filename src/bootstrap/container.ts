@@ -34,6 +34,8 @@ import { RegistryClient } from '../infrastructure/registry/client.js';
 import { Installer } from '../infrastructure/installers/installer.js';
 import { InstallationService } from '../application/installation-service.js';
 import { LocalPlanService } from '../application/local-plan-service.js';
+import { AgentAvailabilityService } from '../application/agent-availability-service.js';
+import { AgentSetupService } from '../application/agent-setup-service.js';
 import { HistoryService } from '../application/history-service.js';
 import { TerminalManager } from '../infrastructure/platform/terminal-manager.js';
 import { readText, writeText, checkedPath } from '../infrastructure/platform/file-callbacks.js';
@@ -64,6 +66,8 @@ export class Container {
   readonly registry;
   readonly installations;
   readonly local;
+  readonly availability;
+  readonly setup;
   readonly history;
   readonly storage;
   readonly collaboration;
@@ -115,6 +119,16 @@ export class Container {
       settings.maxInstallations,
     );
     this.local = new LocalPlanService(this.installations);
+    this.availability = new AgentAvailabilityService(store);
+    this.setup = new AgentSetupService(
+      this.installations,
+      this.availability,
+      this.local,
+      this.identities,
+    );
+    this.local.validateConfig = (config, configId) => this.setup.requireReady(config, configId);
+    this.local.onChange = () => this.availability.refresh();
+    this.configs.onChange = () => this.availability.refresh();
     this.history = new HistoryService(this.events, this.operations, this.runtimes);
     this.collaboration = new CollaborationController(this);
     this.collaborationIpc = new CollaborationIpc(this);
@@ -384,6 +398,7 @@ export class Container {
   /** 停止新维护工作，收敛下游任务，再写入实例终态；存储必须最后关闭。 */
   private async shutdown() {
     clearInterval(this.timer);
+    await this.availability.close();
     await this.collaboration.shutdown();
     for (const task of await this.store.list<WorkRecord>('task'))
       if (

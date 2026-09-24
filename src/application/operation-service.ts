@@ -6,7 +6,16 @@ import type { Context, WorkRecord } from '../domain/models.js';
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import { idem, Serial } from './common.js';
-import type { Row, Transaction } from '../infrastructure/storage/protocol.js';
+import type { EventInput, Row, Transaction } from '../infrastructure/storage/protocol.js';
+
+/** 与操作修订同事务保存；幂等重放和失败回滚均不会留下多余事件。 */
+export function operationUpdateEvent(work: WorkRecord): EventInput {
+  return {
+    streamId: work.id,
+    kind: 'operation_update',
+    payload: { state: work.state, step: work.step, revision: work.revision },
+  };
+}
 
 /** 为安装、认证、恢复等长操作提供统一的持久化状态、幂等受理和实例内取消句柄。 */
 export class OperationService {
@@ -127,11 +136,7 @@ export class OperationService {
           row('operation', next),
           ...(terminalStates.has(next.state) ? await this.terminalRecords(next) : []),
         ],
-      });
-      await this.store.appendEvent({
-        streamId: operationId,
-        kind: 'operation_update',
-        payload: { state: next.state, step: next.step, revision: next.revision },
+        events: [operationUpdateEvent(next)],
       });
     });
   }

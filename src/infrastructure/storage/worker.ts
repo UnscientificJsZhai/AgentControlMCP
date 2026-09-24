@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { parentPort, workerData } from 'node:worker_threads';
-import type { RpcRequest, RpcResponse, Transaction } from './protocol.js';
+import type { EventInput, RpcRequest, RpcResponse, Transaction } from './protocol.js';
 import { AppError, fail } from '../../domain/errors.js';
 import { now } from '../../domain/ids.js';
 
@@ -113,6 +113,8 @@ function transaction(input: Transaction) {
         if (row.ifAbsent && previous) continue;
         projected += Buffer.byteLength(JSON.stringify(row.data)) - (previous?.bytes ?? 0);
       }
+      for (const event of input.events ?? [])
+        projected += Buffer.byteLength(JSON.stringify(event.payload));
       if (projected > input.maxLogicalBytes) fail('STORAGE_FULL', '存储容量已满，未接受协作请求。');
     }
     for (const alias of input.idempotencyAliases ?? []) {
@@ -145,6 +147,7 @@ function transaction(input: Transaction) {
         entry.digest,
         JSON.stringify(entry.response),
       );
+    for (const event of input.events ?? []) writeEvent(event);
     db.exec('COMMIT');
     return { replayed: false, response: idem?.response };
   } catch (error) {
@@ -154,55 +157,52 @@ function transaction(input: Transaction) {
 }
 
 /** 事件序号、事件体、分段体积与会话投影同事务更新，避免查询到没有对应事件的新状态。 */
-function eventAppend(args: {
-  streamId: string;
-  taskId?: string;
-  segmentId?: string;
-  activationId?: string;
-  kind: string;
-  payload: unknown;
-  projection?: Record<string, unknown>;
-}) {
+function writeEvent(args: EventInput) {
+  db.prepare('INSERT OR IGNORE INTO streams(id) VALUES (?)').run(args.streamId);
+  db.prepare('UPDATE streams SET seq=seq+1 WHERE id=?').run(args.streamId);
+  const seq = db.prepare('SELECT seq FROM streams WHERE id=?').get(args.streamId)?.seq as number;
+  const payload = JSON.stringify(args.payload);
+  const size = Buffer.byteLength(payload);
+  db.prepare('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)').run(
+    args.streamId,
+    seq,
+    args.taskId ?? null,
+    args.segmentId ?? null,
+    args.activationId ?? null,
+    args.kind,
+    payload,
+    now(),
+    size,
+  );
+  if (args.segmentId)
+    db.prepare(
+      "UPDATE records SET revision=revision+1,data=json_set(data,'$.bytes',json_extract(data,'$.bytes')+?,'$.revision',revision+1) WHERE kind='segment' AND id=?",
+    ).run(size, args.segmentId);
+  if (args.projection) {
+    const session = decode(
+      db.prepare("SELECT data FROM records WHERE kind='session' AND id=?").get(args.streamId),
+    ) as Record<string, unknown> | null;
+    if (session) {
+      Object.assign(session, args.projection);
+      session.revision = Number(session.revision) + 1;
+      if ('options' in args.projection || 'modes' in args.projection)
+        session.controlVersion = Number(session.controlVersion) + 1;
+      db.prepare("UPDATE records SET data=?,revision=? WHERE kind='session' AND id=?").run(
+        JSON.stringify(session),
+        Number(session.revision),
+        args.streamId,
+      );
+    }
+  }
+  return String(seq);
+}
+
+function eventAppend(args: EventInput) {
   db.exec('BEGIN IMMEDIATE');
   try {
-    db.prepare('INSERT OR IGNORE INTO streams(id) VALUES (?)').run(args.streamId);
-    db.prepare('UPDATE streams SET seq=seq+1 WHERE id=?').run(args.streamId);
-    const seq = db.prepare('SELECT seq FROM streams WHERE id=?').get(args.streamId)?.seq as number;
-    const payload = JSON.stringify(args.payload);
-    const size = Buffer.byteLength(payload);
-    db.prepare('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)').run(
-      args.streamId,
-      seq,
-      args.taskId ?? null,
-      args.segmentId ?? null,
-      args.activationId ?? null,
-      args.kind,
-      payload,
-      now(),
-      size,
-    );
-    if (args.segmentId)
-      db.prepare(
-        "UPDATE records SET revision=revision+1,data=json_set(data,'$.bytes',json_extract(data,'$.bytes')+?,'$.revision',revision+1) WHERE kind='segment' AND id=?",
-      ).run(size, args.segmentId);
-    if (args.projection) {
-      const session = decode(
-        db.prepare("SELECT data FROM records WHERE kind='session' AND id=?").get(args.streamId),
-      ) as Record<string, unknown> | null;
-      if (session) {
-        Object.assign(session, args.projection);
-        session.revision = Number(session.revision) + 1;
-        if ('options' in args.projection || 'modes' in args.projection)
-          session.controlVersion = Number(session.controlVersion) + 1;
-        db.prepare("UPDATE records SET data=?,revision=? WHERE kind='session' AND id=?").run(
-          JSON.stringify(session),
-          Number(session.revision),
-          args.streamId,
-        );
-      }
-    }
+    const seq = writeEvent(args);
     db.exec('COMMIT');
-    return String(seq);
+    return seq;
   } catch (error) {
     db.exec('ROLLBACK');
     throw error;

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { Container } from '../../src/bootstrap/container.js';
 import type { Context } from '../../src/domain/models.js';
 import { createTools } from '../../src/transport/mcp/tools.js';
-import { createMcpTools, describeTool } from '../../src/transport/mcp/catalog.js';
+import { createMcpTools, describeTool, toolsForPhase } from '../../src/transport/mcp/catalog.js';
 
 const directNames = [
   'agent_list',
@@ -35,20 +35,36 @@ const directNames = [
   'content_read',
 ];
 
-void test('默认协作八工具与独立管理四工具均为静态目录', () => {
+void test('默认定义全集含接入三工具和协作八工具，管理四工具保持不变', () => {
   const app = {} as Container;
+  const allTools = [
+    'discover_agents',
+    'setup_agent',
+    'wait_agent_setup',
+    'spawn_agent',
+    'list_agents',
+    'send_message',
+    'followup_task',
+    'wait_agent',
+    'interrupt_agent',
+    'respond_agent',
+    'close_agent',
+  ];
   assert.deepEqual(
     createMcpTools(app).map((t) => t.name),
-    [
-      'spawn_agent',
-      'list_agents',
-      'send_message',
-      'followup_task',
-      'wait_agent',
-      'interrupt_agent',
-      'respond_agent',
-      'close_agent',
-    ],
+    allTools,
+  );
+  assert.deepEqual(
+    toolsForPhase(createMcpTools(app), 'bootstrap').map((t) => t.name),
+    ['discover_agents', 'setup_agent', 'wait_agent_setup'],
+  );
+  assert.deepEqual(
+    toolsForPhase(createMcpTools(app), 'ready').map((t) => t.name),
+    allTools,
+  );
+  assert.deepEqual(
+    toolsForPhase(createMcpTools(app), 'recovery').map((t) => t.name),
+    allTools.filter((name) => name !== 'spawn_agent'),
   );
   assert.deepEqual(
     createMcpTools(app, 'management').map((t) => t.name),

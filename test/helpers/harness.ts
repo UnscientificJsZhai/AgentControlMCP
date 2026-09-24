@@ -98,7 +98,7 @@ export async function harness(mode: Context['mode'] = 'http', env: Record<string
 
 /** 轮询可观测状态代替固定长延迟；真值表示条件满足，每轮结束后检查累计耗时。 */
 export async function until<T>(
-  fn: () => Promise<T | null | false | undefined>,
+  fn: () => Promise<T | null | false | undefined> | (T | null | false | undefined),
   timeout = 15_000,
 ): Promise<T> {
   const deadline = Date.now() + timeout;

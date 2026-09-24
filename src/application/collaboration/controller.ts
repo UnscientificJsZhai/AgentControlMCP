@@ -25,6 +25,7 @@ import type { Row } from '../../infrastructure/storage/protocol.js';
 import { row } from '../../infrastructure/storage/sqlite-store.js';
 import { inside } from '../../infrastructure/platform/file-callbacks.js';
 import type { ConfigService } from '../config-service.js';
+import type { AgentAvailabilityService } from '../agent-availability-service.js';
 import type { TaskService } from '../task-service.js';
 import type { InteractionService, PermissionDecision } from '../interaction-service.js';
 import type { IdentityService } from '../identity-service.js';
@@ -37,6 +38,7 @@ export interface CollaborationDependencies {
   store: SqliteStore;
   tasks: TaskService;
   configs: ConfigService;
+  availability: AgentAvailabilityService;
   interactions: InteractionService;
   identities: IdentityService;
   auth: AuthService;
@@ -278,14 +280,21 @@ export class CollaborationController {
         : undefined;
       const profile =
         args.profile ?? parent?.configId ?? this.app.settings.collaborationDefaultProfile;
-      const configs = (await this.app.configs.list()).filter((c) => c.config.enabled);
+      const availability = await this.app.availability.snapshot();
+      const configs = availability.profiles
+        .filter((p) => p.availability.ready)
+        .map((p) => p.record);
       const matches = profile
         ? configs.filter((c) => c.id === profile || c.config.name === profile)
         : configs;
       if (matches.length !== 1)
-        fail('CONFIG_INVALID', '请选择唯一的已注册 profile，或设置 collaborationDefaultProfile。', {
-          profiles: configs.map((c) => ({ profile: c.id, name: c.config.name })),
-        });
+        fail(
+          'CONFIG_INVALID',
+          '请选择唯一的可用 profile；调用 discover_agents 查看接入状态。不会自动安装或替换所选 Agent。',
+          {
+            profiles: configs.map((c) => ({ profile: c.id, name: c.config.name })),
+          },
+        );
       let config = matches[0]!;
       if (parent) {
         if (config.id !== parent.configId)
@@ -529,9 +538,9 @@ export class CollaborationController {
     return {
       teams: teams.map(({ id, cwd, instanceId }) => ({ teamId: id, cwd, instanceId })),
       agents: await Promise.all(members.map((a) => this.visibleView(ctx, a))),
-      profiles: (await this.app.configs.list())
-        .filter((c) => c.config.enabled)
-        .map((c) => ({ profile: c.id, name: c.config.name })),
+      profiles: (await this.app.availability.snapshot()).profiles
+        .filter((p) => p.availability.ready)
+        .map(({ record: c }) => ({ profile: c.id, name: c.config.name })),
     };
   }
 

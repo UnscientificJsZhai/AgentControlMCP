@@ -8,10 +8,12 @@ import type { ConfigRecord, Context, InstallationRecord, WorkRecord } from '../d
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import { idem, Serial } from './common.js';
+import { operationUpdateEvent } from './operation-service.js';
 
 /** 以数据库为配置事实来源，保留不可变修订快照，并维护供本地编辑的 JSON 投影。 */
 export class ConfigService {
   private readonly serial = new Serial();
+  onChange: () => Promise<void> = async () => {};
 
   constructor(
     readonly store: SqliteStore,
@@ -32,7 +34,7 @@ export class ConfigService {
     return this.store.list<ConfigRecord>('config');
   }
 
-  private async validate(config: AgentConfig) {
+  async validate(config: AgentConfig) {
     if (config.launch.kind === 'installation') {
       const install = await this.store.get<InstallationRecord>(
         'installation',
@@ -48,17 +50,46 @@ export class ConfigService {
         fail('CONFIG_INVALID', '下游不能递归挂载连接器自身。');
   }
 
-  async register(ctx: Context, args: { config: AgentConfig; idempotencyKey: string }) {
+  async register(
+    ctx: Context,
+    args: { config: AgentConfig; idempotencyKey: string },
+    operation?: WorkRecord,
+  ) {
     const config = agentConfig.parse(args.config);
     await this.validate(config);
     const record: ConfigRecord = { id: id('cfg'), revision: 1, createdAt: now(), config };
-    const response = { configId: record.id, revision: 1 };
+    const response = {
+      configId: record.id,
+      revision: 1,
+      ...(operation && config.launch.kind === 'installation'
+        ? { installationId: config.launch.installationId }
+        : {}),
+    };
+    const completed: WorkRecord | undefined = operation
+      ? {
+          ...operation,
+          revision: operation.revision + 1,
+          commitState: 'committed',
+          state: 'completed',
+          result: response,
+          endedAt: now(),
+        }
+      : undefined;
     const result = await this.store.commit({
-      puts: [row('config', record), { ...row('config_revision', record), id: `${record.id}:1` }],
-      checks:
-        config.launch.kind === 'installation'
+      puts: [
+        row('config', record),
+        { ...row('config_revision', record), id: `${record.id}:1` },
+        ...(completed ? [row('operation', completed)] : []),
+      ],
+      events: completed ? [operationUpdateEvent(completed)] : [],
+      checks: [
+        ...(operation
+          ? [{ kind: 'operation', id: operation.id, revision: operation.revision }]
+          : []),
+        ...(config.launch.kind === 'installation'
           ? [{ kind: 'installation', id: config.launch.installationId, state: 'ready' }]
-          : [],
+          : []),
+      ],
       claims:
         config.launch.kind === 'installation'
           ? [
@@ -70,6 +101,7 @@ export class ConfigService {
           : [],
       idempotency: idem(ctx, 'agent_register', args, response),
     });
+    if (!result.replayed) await this.onChange().catch(() => {});
     const projection = !result.replayed ? await this.project(record) : {};
     return { ...(result.response as typeof response), ...projection };
   }
@@ -140,6 +172,7 @@ export class ConfigService {
           : [],
       idempotency: idem(ctx, 'agent_update', args, response),
     });
+    if (!result.replayed) await this.onChange().catch(() => {});
     const projection = !result.replayed ? await this.project(record) : {};
     return { ...(result.response as typeof response), ...projection };
   }
@@ -167,6 +200,7 @@ export class ConfigService {
           : [],
       idempotency: idem(ctx, 'agent_remove', args, { removed: true }),
     });
+    if (!result.replayed) await this.onChange().catch(() => {});
     return result.response;
   }
 
