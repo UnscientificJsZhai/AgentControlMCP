@@ -180,10 +180,15 @@ export class RegistryClient {
         headers: source.etag ? { 'If-None-Match': source.etag } : {},
       });
       if (fetched.response.status === 304 && source.snapshotId) {
-        await this.store.put('source', {
-          ...source,
-          revision: source.revision + 1,
-          fetchedAt: now(),
+        await this.store.commit({
+          checks: [{ kind: 'source', id: source.id, revision: source.revision }],
+          puts: [
+            row('source', {
+              ...source,
+              revision: source.revision + 1,
+              fetchedAt: now(),
+            }),
+          ],
         });
         return this.store.get<RegistrySnapshot>('registry_snapshot', source.snapshotId);
       }
@@ -214,13 +219,22 @@ export class RegistryClient {
       });
       return snapshot;
     } catch (error) {
-      const current = await this.store.get<RegistrySource>('source', sourceId);
-      if (current?.revision === source.revision)
-        await this.store.put('source', {
-          ...source,
-          revision: source.revision + 1,
-          error: '刷新失败；保留原缓存与固定版本。',
+      try {
+        await this.store.commit({
+          checks: [{ kind: 'source', id: source.id, revision: source.revision }],
+          puts: [
+            row('source', {
+              ...source,
+              revision: source.revision + 1,
+              error: '刷新失败；保留原缓存与固定版本。',
+            }),
+          ],
         });
+      } catch (recordError) {
+        // 并发配置已提交时放弃旧请求的错误记录，仍向调用方返回原始刷新错误。
+        if (!(recordError instanceof AppError && recordError.code === 'REVISION_CONFLICT'))
+          throw recordError;
+      }
       throw error;
     }
   }
