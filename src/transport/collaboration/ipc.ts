@@ -27,7 +27,6 @@ interface MemberCredential {
   runtimeId: string;
   generation: number;
   path: string;
-  expires: number;
 }
 
 /** 专用、最小权限的 IPC。凭据不复用管理 nonce，不传递管理员 Context。 */
@@ -110,7 +109,6 @@ export class CollaborationIpc {
       runtimeId: runtime.id,
       generation: runtime.connectionGeneration,
       path,
-      expires: Date.now() + 30 * 60_000,
     });
     await writeFile(path, JSON.stringify({ endpoint: this.endpoint, token }), {
       mode: 0o600,
@@ -133,10 +131,10 @@ export class CollaborationIpc {
     ];
   }
 
+  /** 凭据随 Runtime 绑定存活；每次请求都重新校验连接代次、成员状态及上游身份。 */
   private async authenticate(token: string): Promise<Context> {
     const credential = this.credentials.get(digest(token));
-    if (!credential || credential.expires <= Date.now())
-      fail('UNAUTHENTICATED', '成员绑定已过期或撤销。');
+    if (!credential) fail('UNAUTHENTICATED', '成员绑定不存在或已撤销。');
     const agent = await this.app.collaboration.agent(credential.agentId);
     const runtime = await this.app.store.get<RuntimeRecord>('runtime', credential.runtimeId);
     if (
@@ -156,7 +154,6 @@ export class CollaborationIpc {
       collaborationMember: { agentId: agent.id, teamId: team.id },
     };
     await this.app.identities.check(ctx);
-    credential.expires = Date.now() + 30 * 60_000;
     return ctx;
   }
 
