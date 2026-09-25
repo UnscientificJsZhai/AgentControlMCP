@@ -642,42 +642,7 @@ export function createTools(app: Container): ToolDefinition[] {
     'session_delete',
     '所有者显式删除已关闭的下游会话；与连接器历史清理不同。',
     obj({ sessionId: text, ...revision, ...write }),
-    async (ctx, args) => {
-      const original = await app.sessions.get(ctx, args.sessionId, 'owner');
-      if (original.state === 'ready' || original.activeTaskId)
-        fail('OBJECT_IN_USE', '请先关闭会话。');
-      return app.operations.start(
-        ctx,
-        'session_delete',
-        args,
-        async (op, signal) => {
-          const session = await app.sessions.get(ctx, args.sessionId, 'owner');
-          if (session.revision !== args.expectedRevision)
-            fail('REVISION_CONFLICT', '会话修订已变化。');
-          const runtime = await app.runtimes.prepareNow(
-            ctx,
-            { configId: session.configId, cwd: session.cwd },
-            op,
-            signal,
-          );
-          try {
-            const client = app.runtimes.handle(runtime).client;
-            requireCapability(client.initialize.agentCapabilities ?? {}, 'delete');
-            await client.request(
-              'session/delete',
-              { sessionId: session.downstreamSessionId },
-              app.settings.controlTimeoutMs,
-              signal,
-            );
-            await app.sessions.mutate(session.id, (current) => ({ ...current, state: 'deleted' }));
-            return { sessionId: session.id, deleted: true };
-          } finally {
-            await app.runtimes.closeNow(runtime.id);
-          }
-        },
-        { sessionId: original.id },
-      );
-    },
+    (ctx, args) => app.sessions.delete(ctx, args),
     false,
     true,
   );

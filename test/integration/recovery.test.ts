@@ -91,10 +91,37 @@ void test('AC-008: 恢复保留会话终态并清理遗留租约，不影响存�
     };
     const leaseKey = (session: SessionRecord) =>
       `session:${digest([session.namespace, session.downstreamSessionId])}`;
+    const operationSessions = ['delete', 'load', 'deleted', 'reassigned', 'live'].map(
+      (name): SessionRecord => ({
+        ...sessions[0]!,
+        id: `operation-session-${name}`,
+        // 新操作可以删除或恢复另一实例留下的已关闭会话。
+        instanceId: liveInstance.id,
+        runtimeId: `operation-runtime-${name}`,
+        downstreamSessionId: `operation-downstream-${name}`,
+        state: name === 'deleted' ? 'deleted' : 'closed',
+      }),
+    );
+    const operations = operationSessions.map((session, index): WorkRecord => ({
+      id: `operation-${index}`,
+      revision: 2,
+      createdAt: timestamp,
+      kind: 'operation',
+      ownerId: 'owner',
+      instanceId: index === 4 ? liveInstance.id : deadInstance.id,
+      type: index === 1 ? 'session_load' : 'session_delete',
+      sessionId: session.id,
+      state: 'running',
+      commitState: index === 2 ? 'committed' : 'pending',
+      dispatchOutcome: index === 2 ? 'confirmed' : 'unknown',
+    }));
     await store.commit({
       puts: [
         ...[deadInstance, liveInstance].map((instance) => row('instance', instance)),
-        ...[...sessions, liveSession, reassignedSession].map((session) => row('session', session)),
+        ...[...sessions, liveSession, reassignedSession, ...operationSessions].map((session) =>
+          row('session', session),
+        ),
+        ...operations.map((operation) => row('operation', operation)),
       ],
       claims: [
         ...[...sessions, liveSession].map((session) => ({
@@ -102,6 +129,10 @@ void test('AC-008: 恢复保留会话终态并清理遗留租约，不影响存�
           holder: session.runtimeId,
         })),
         { key: leaseKey(reassignedSession), holder: liveSession.runtimeId },
+        ...operationSessions.map((session, index) => ({
+          key: leaseKey(session),
+          holder: index === 3 ? liveSession.runtimeId : operations[index]!.id,
+        })),
       ],
     });
 
@@ -129,6 +160,16 @@ void test('AC-008: 恢复保留会话终态并清理遗留租约，不影响存�
     assert.deepEqual(await store.get('session', reassignedSession.id), reassignedSession);
     assert.equal(await store.claim(leaseKey(liveSession)), liveSession.runtimeId);
     assert.equal(await store.claim(leaseKey(reassignedSession)), liveSession.runtimeId);
+    for (const [index, session] of operationSessions.entries()) {
+      assert.deepEqual(await store.get('session', session.id), session);
+      const operation = (await store.get<WorkRecord>('operation', operations[index]!.id))!;
+      assert.equal(operation.state, index === 4 ? 'running' : 'interrupted');
+      assert.equal(operation.dispatchOutcome, operations[index]!.dispatchOutcome);
+      assert.equal(
+        await store.claim(leaseKey(session)),
+        index === 3 ? liveSession.runtimeId : index === 4 ? operation.id : null,
+      );
+    }
 
     const recoveredSessions = await store.list<SessionRecord>('session');
     assert.deepEqual(await recover(store), {

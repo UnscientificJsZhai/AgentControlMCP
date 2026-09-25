@@ -635,6 +635,103 @@ export class SessionService {
     );
   }
 
+  /** 在准备 Runtime 前占用下游会话；恢复可在绑定事务中将占用交给新 Runtime。 */
+  private async withSessionLease<T>(
+    session: SessionRecord,
+    operationId: string,
+    action: (lease: { key: string; holder: string }) => Promise<T>,
+  ) {
+    const lease = {
+      key: `session:${digest([session.namespace, session.downstreamSessionId])}`,
+      holder: operationId,
+    };
+    await this.store.commit({
+      checks: [
+        { kind: 'session', id: session.id, revision: session.revision, state: session.state },
+      ],
+      claims: [lease],
+    });
+    try {
+      return await action(lease);
+    } finally {
+      // 转交后的 Runtime 占用不属于此操作，不能在这里释放。
+      await this.store.commit({ releases: [lease] });
+    }
+  }
+
+  /** 删除只作用于已停止的会话；临时 Runtime 退出前始终持有跨实例生命周期占用。 */
+  async delete(
+    ctx: Context,
+    args: { sessionId: string; expectedRevision: number; idempotencyKey: string },
+  ) {
+    await this.get(ctx, args.sessionId, 'owner');
+    return this.operations.start(
+      ctx,
+      'session_delete',
+      args,
+      async (operationId, signal) => {
+        const session = await this.get(ctx, args.sessionId, 'owner');
+        if (session.revision !== args.expectedRevision)
+          fail('REVISION_CONFLICT', '会话修订已变化。');
+        if (!['closed', 'interrupted'].includes(session.state) || session.activeTaskId)
+          fail('OBJECT_IN_USE', '只能删除已停止且未删除的会话。');
+        return this.withSessionLease(session, operationId, async () => {
+          let runtime: RuntimeRecord | undefined;
+          try {
+            signal.throwIfAborted();
+            runtime = await this.runtimes.prepareNow(
+              ctx,
+              { configId: session.configId, cwd: session.cwd },
+              operationId,
+              signal,
+            );
+            const client = this.runtimes.handle(runtime).client;
+            requireCapability(client.initialize.agentCapabilities ?? {}, 'delete');
+            await this.operations.update(operationId, { dispatchOutcome: 'unknown' });
+            await client.request(
+              'session/delete',
+              { sessionId: session.downstreamSessionId },
+              this.runtimes.settings.controlTimeoutMs,
+              signal,
+            );
+            await this.operations.serial.run(operationId, async () => {
+              const operation = (await this.store.get<WorkRecord>('operation', operationId))!;
+              // 已确认的下游删除不能被迟到取消撤销；本地状态与提交点必须一起落盘。
+              await this.store.commit({
+                checks: [
+                  {
+                    kind: 'session',
+                    id: session.id,
+                    revision: session.revision,
+                    state: session.state,
+                  },
+                  { kind: 'operation', id: operationId, revision: operation.revision },
+                ],
+                puts: [
+                  row('session', {
+                    ...session,
+                    state: 'deleted',
+                    revision: session.revision + 1,
+                  }),
+                  row('operation', {
+                    ...operation,
+                    commitState: 'committed',
+                    dispatchOutcome: 'confirmed',
+                    revision: operation.revision + 1,
+                  }),
+                ],
+              });
+            });
+            return { sessionId: session.id, deleted: true };
+          } finally {
+            if (runtime) await this.runtimes.closeNow(runtime.id);
+          }
+        });
+      },
+      { sessionId: args.sessionId },
+    );
+  }
+
   /** Runtime 结束时封口事件段、记录激活终点并释放下游会话租约，保留逻辑会话历史。 */
   async ended(runtimeId: string) {
     for (const session of await this.store.list<SessionRecord>('session'))
@@ -691,6 +788,7 @@ export class SessionService {
     },
   ) {
     const original = await this.get(ctx, args.sessionId, 'control');
+    if (original.state === 'deleted') fail('RECOVERY_CONFLICT', '会话已删除，不能恢复。');
     if (original.state === 'ready' || original.state === 'creating')
       fail('RECOVERY_CONFLICT', '会话仍在运行，必须先显式关闭。');
     if (args.phase === 'prepare') {
@@ -739,134 +837,156 @@ export class SessionService {
       args,
       async (operationId, signal) => {
         await this.get(ctx, original.id, 'control');
-        const runtime = args.preparedRuntime
-          ? await this.runtimes.get(ctx, args.preparedRuntime.runtimeId, true)
-          : await this.runtimes.prepareNow(
-              ctx,
-              { configId: plan.configId, configRevision: plan.configRevision, cwd: original.cwd },
-              operationId,
-              signal,
-            );
-        if (args.preparedRuntime)
-          this.runtimes.guard(
-            runtime,
-            args.preparedRuntime.expectedRuntimeRevision,
-            args.preparedRuntime.expectedConnectionGeneration,
-          );
-        if (
-          runtime.state !== 'prepared' ||
-          runtime.configId !== plan.configId ||
-          runtime.configRevision !== plan.configRevision ||
-          runtime.cwd !== original.cwd ||
-          this.runtimes.lifecycle.has(runtime.id)
-        )
-          fail('PLAN_CHANGED', '准备的 Runtime 与恢复方案不一致。');
-        const handle = this.runtimes.handle(runtime);
-        requireCapability(handle.client.initialize.agentCapabilities ?? {}, method);
-        const lease = `session:${digest([original.namespace, original.downstreamSessionId])}`;
-        const activation: ActivationRecord = {
-          id: id('act'),
-          revision: 1,
-          createdAt: now(),
-          sessionId: original.id,
-          runtimeId: runtime.id,
-          instanceId: this.runtimes.instanceId,
-          downstreamSessionId: original.downstreamSessionId,
-          startedAt: now(),
-        };
-        await this.store.commit({
-          checks: [
-            { kind: 'session', id: original.id, revision: original.revision },
-            { kind: 'runtime', id: runtime.id, revision: runtime.revision },
-          ],
-          claims: [{ key: lease, holder: runtime.id }],
-          puts: [
-            row('runtime', { ...runtime, state: 'binding', revision: runtime.revision + 1 }),
-            row('activation', activation),
-            row('session', {
-              ...original,
-              revision: original.revision + 1,
-              state: 'creating',
-              runtimeId: runtime.id,
-              activationId: activation.id,
-              instanceId: this.runtimes.instanceId,
-              snapshot: runtime.snapshot,
-            }),
-          ],
-        });
-        this.runtimes.lifecycle.add(runtime.id);
-        handle.sessionId = original.id;
-        handle.operationId = operationId;
-        await this.operations.update(operationId, { runtimeId: runtime.id });
-        const replayId =
-          method === 'load'
-            ? await this.events.segment(await this.get(ctx, original.id), 'history_replay')
-            : null;
-        if (replayId) this.events.replay.set(runtime.id, replayId);
-        try {
-          const params = {
-            ...(await this.params(
-              runtime,
-              original.additionalDirectories,
-              runtime.snapshot.mcpServers,
-            )),
-            sessionId: original.downstreamSessionId,
-          };
-          params.mcpServers.push(...(await this.managedServers(ctx, runtime)));
-          const response =
-            method === 'load'
-              ? await handle.client.request(
-                  'session/load',
-                  params,
-                  this.runtimes.settings.controlTimeoutMs,
-                  signal,
-                )
-              : await handle.client.request(
-                  'session/resume',
-                  params,
-                  this.runtimes.settings.controlTimeoutMs,
+        return this.withSessionLease(original, operationId, async (lease) => {
+          let runtime: RuntimeRecord | undefined;
+          let bound = false;
+          let dispatched = false;
+          let replayId: string | null = null;
+          try {
+            signal.throwIfAborted();
+            runtime = args.preparedRuntime
+              ? await this.runtimes.get(ctx, args.preparedRuntime.runtimeId, true)
+              : await this.runtimes.prepareNow(
+                  ctx,
+                  {
+                    configId: plan.configId,
+                    configRevision: plan.configRevision,
+                    cwd: original.cwd,
+                  },
+                  operationId,
                   signal,
                 );
-          await this.bind(original.id, runtime.id, operationId, {
-            options: response.configOptions ?? [],
-            modes: response.modes ?? null,
-          });
-          return this.view(ctx, original.id);
-        } catch (error) {
-          if (
-            (await this.store.get<WorkRecord>('operation', operationId))?.commitState ===
-            'committed'
-          )
-            throw error;
-          if (signal.aborted) {
-            await this.runtimes.closeNow(runtime.id);
-            throw error;
-          }
-          await this.mutate(original.id, (current) => ({ ...current, state: 'interrupted' }));
-          if (error instanceof AppError && error.code === 'AUTH_REQUIRED') {
-            delete handle.sessionId;
-            await this.store.commit({ releases: [{ key: lease, holder: runtime.id }] });
-            const updated = await this.runtimes.update(runtime.id, {
-              state: 'prepared',
-              authState: 'required',
+            if (args.preparedRuntime)
+              this.runtimes.guard(
+                runtime,
+                args.preparedRuntime.expectedRuntimeRevision,
+                args.preparedRuntime.expectedConnectionGeneration,
+              );
+            if (
+              runtime.state !== 'prepared' ||
+              runtime.configId !== plan.configId ||
+              runtime.configRevision !== plan.configRevision ||
+              runtime.cwd !== original.cwd ||
+              this.runtimes.lifecycle.has(runtime.id)
+            )
+              fail('PLAN_CHANGED', '准备的 Runtime 与恢复方案不一致。');
+            const handle = this.runtimes.handle(runtime);
+            requireCapability(handle.client.initialize.agentCapabilities ?? {}, method);
+            const activation: ActivationRecord = {
+              id: id('act'),
+              revision: 1,
+              createdAt: now(),
+              sessionId: original.id,
+              runtimeId: runtime.id,
+              instanceId: this.runtimes.instanceId,
+              downstreamSessionId: original.downstreamSessionId,
+              startedAt: now(),
+            };
+            await this.store.commit({
+              checks: [
+                { kind: 'session', id: original.id, revision: original.revision },
+                { kind: 'runtime', id: runtime.id, revision: runtime.revision },
+              ],
+              releases: [lease],
+              claims: [{ key: lease.key, holder: runtime.id }],
+              puts: [
+                row('runtime', { ...runtime, state: 'binding', revision: runtime.revision + 1 }),
+                row('activation', activation),
+                row('session', {
+                  ...original,
+                  revision: original.revision + 1,
+                  state: 'creating',
+                  runtimeId: runtime.id,
+                  activationId: activation.id,
+                  instanceId: this.runtimes.instanceId,
+                  snapshot: runtime.snapshot,
+                }),
+              ],
             });
-            throw new AppError(
-              'AUTH_REQUIRED',
-              '请在此 Runtime 认证后，重新准备恢复方案并显式 apply。',
-              {
-                runtimeId: runtime.id,
-                runtimeRevision: updated.revision,
-                connectionGeneration: updated.connectionGeneration,
-              },
-            );
+            bound = true;
+            this.runtimes.lifecycle.add(runtime.id);
+            handle.sessionId = original.id;
+            handle.operationId = operationId;
+            await this.operations.update(operationId, { runtimeId: runtime.id });
+            replayId =
+              method === 'load'
+                ? await this.events.segment(await this.get(ctx, original.id), 'history_replay')
+                : null;
+            if (replayId) this.events.replay.set(runtime.id, replayId);
+            const params = {
+              ...(await this.params(
+                runtime,
+                original.additionalDirectories,
+                runtime.snapshot.mcpServers,
+              )),
+              sessionId: original.downstreamSessionId,
+            };
+            params.mcpServers.push(...(await this.managedServers(ctx, runtime)));
+            signal.throwIfAborted();
+            dispatched = true;
+            const response =
+              method === 'load'
+                ? await handle.client.request(
+                    'session/load',
+                    params,
+                    this.runtimes.settings.controlTimeoutMs,
+                    signal,
+                  )
+                : await handle.client.request(
+                    'session/resume',
+                    params,
+                    this.runtimes.settings.controlTimeoutMs,
+                    signal,
+                  );
+            await this.bind(original.id, runtime.id, operationId, {
+              options: response.configOptions ?? [],
+              modes: response.modes ?? null,
+            });
+            return this.view(ctx, original.id);
+          } catch (error) {
+            if (!runtime) throw error;
+            if (!bound) {
+              if (!args.preparedRuntime) await this.runtimes.closeNow(runtime.id);
+              throw error;
+            }
+            if (
+              (await this.store.get<WorkRecord>('operation', operationId))?.commitState ===
+              'committed'
+            )
+              throw error;
+            if (signal.aborted || !dispatched) {
+              await this.runtimes.closeNow(runtime.id);
+              throw error;
+            }
+            await this.mutate(original.id, (current) => ({ ...current, state: 'interrupted' }));
+            if (error instanceof AppError && error.code === 'AUTH_REQUIRED') {
+              const handle = this.runtimes.live.get(runtime.id);
+              if (handle) delete handle.sessionId;
+              await this.store.commit({ releases: [{ key: lease.key, holder: runtime.id }] });
+              const updated = await this.runtimes.update(runtime.id, {
+                state: 'prepared',
+                authState: 'required',
+              });
+              throw new AppError(
+                'AUTH_REQUIRED',
+                '请在此 Runtime 认证后，重新准备恢复方案并显式 apply。',
+                {
+                  runtimeId: runtime.id,
+                  runtimeRevision: updated.revision,
+                  connectionGeneration: updated.connectionGeneration,
+                },
+              );
+            }
+            await this.runtimes.update(runtime.id, { state: 'creation_unknown' });
+            throw error;
+          } finally {
+            if (replayId) await this.events.seal(replayId);
+            if (runtime && bound) {
+              this.events.replay.delete(runtime.id);
+              this.runtimes.lifecycle.delete(runtime.id);
+            }
           }
-          await this.runtimes.update(runtime.id, { state: 'creation_unknown' });
-          throw error;
-        } finally {
-          if (replayId) await this.events.seal(replayId);
-          this.events.replay.delete(runtime.id);
-          this.runtimes.lifecycle.delete(runtime.id);
-        }
+        });
       },
       { sessionId: original.id },
     );

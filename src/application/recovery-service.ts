@@ -63,6 +63,15 @@ export async function recover(store: SqliteStore) {
             deletes.push({ kind: 'task_slot', id: record.id });
             releases.push({ key: `prompt:${record.sessionId!}`, holder: record.id });
           }
+          if (kind === 'operation' && record.sessionId) {
+            const session = await store.get<SessionRecord>('session', record.sessionId);
+            // 准备阶段的占用属于 operation，原会话仍可能归属于另一个实例。
+            if (session)
+              releases.push({
+                key: `session:${digest([session.namespace, session.downstreamSessionId])}`,
+                holder: record.id,
+              });
+          }
         }
     const runtimeIds = new Set<string>();
     const teams = new Set(
