@@ -174,36 +174,49 @@ export class CollaborationScheduler {
       const deliveredMail =
         intent?.mailAfter !== undefined &&
         ['unknown', 'confirmed'].includes(completion.work.dispatchOutcome ?? '');
-      await this.controller.storage.append(team, [message], {
-        checks: [{ kind: 'collab_outbox', id: completion.id, revision: completion.revision }],
-        puts: [
-          row('collab_outbox', {
-            ...completion,
-            delivered: true,
-            revision: completion.revision + 1,
-          }),
-          ...(intent
-            ? [
-                row('collab_intent', {
-                  ...intent,
-                  state: 'settled',
-                  endedAt: completion.work.endedAt,
-                  revision: intent.revision + 1,
-                }),
-              ]
-            : []),
-          ...(paused || deliveredMail
-            ? [
-                row('collab_agent', {
-                  ...agent,
-                  ...(paused ? { queuePaused: true } : {}),
-                  ...(deliveredMail ? { mailAfter: intent.mailAfter! } : {}),
-                  revision: agent.revision + 1,
-                }),
-              ]
-            : []),
-        ],
-      });
+      try {
+        await this.controller.storage.append(team, [message], {
+          checks: [
+            { kind: 'collab_outbox', id: completion.id, revision: completion.revision },
+            ...(intent
+              ? [{ kind: 'collab_intent', id: intent.id, revision: intent.revision }]
+              : []),
+            ...(paused || deliveredMail
+              ? [{ kind: 'collab_agent', id: agent.id, revision: agent.revision }]
+              : []),
+          ],
+          puts: [
+            row('collab_outbox', {
+              ...completion,
+              delivered: true,
+              revision: completion.revision + 1,
+            }),
+            ...(intent
+              ? [
+                  row('collab_intent', {
+                    ...intent,
+                    state: 'settled',
+                    endedAt: completion.work.endedAt,
+                    revision: intent.revision + 1,
+                  }),
+                ]
+              : []),
+            ...(paused || deliveredMail
+              ? [
+                  row('collab_agent', {
+                    ...agent,
+                    ...(paused ? { queuePaused: true } : {}),
+                    ...(deliveredMail ? { mailAfter: intent.mailAfter! } : {}),
+                    revision: agent.revision + 1,
+                  }),
+                ]
+              : []),
+          ],
+        });
+      } catch (error) {
+        if (!(error instanceof AppError && error.code === 'REVISION_CONFLICT')) throw error;
+        // 跨实例交付不共享团队串行锁；整笔回滚后由下一次 tick 重读并计算，继续推进关闭。
+      }
     }
   }
 
