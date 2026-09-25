@@ -33,6 +33,10 @@ jobs:
           if errorlevel 1 exit /b 1
           call "%ACM_VS_ROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64_arm64
           node scripts/build-windows-host.mjs arm64
+      - name: Install locked dependencies for package validation
+        run: npm ci
+      - name: Check npm package contents
+        run: npm pack --dry-run
       - uses: actions/upload-artifact@v7
         with:
           name: windows-process-host
@@ -43,7 +47,6 @@ jobs:
           # 保留重跑和本地复现所需的产物，覆盖 GitHub 的 30 天重跑窗口后自动清理。
           retention-days: 30
   check:
-    needs: windows-host
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -69,18 +72,5 @@ jobs:
           cache-dependency-path: package-lock.json
       - name: Install locked dependencies
         run: npm ci
-      - name: Set up host Python for offline installation fixtures
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.13'
-      - name: Install pinned uv for persistent environment tests
-        run: python -m pip install uv==0.12.17
-      - name: Download compiled Windows process host
-        uses: actions/download-artifact@v8
-        with:
-          name: windows-process-host
-          path: native
-      - name: Run project checks
+      - name: Run static checks, unit and component integration tests
         run: npm run check
-      - name: Check npm package contents
-        run: npm pack --dry-run

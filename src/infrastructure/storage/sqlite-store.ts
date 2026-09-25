@@ -50,21 +50,28 @@ export class SqliteStore {
 
   /** 首次读取充当就绪屏障，确认 Worker 已建库后再收紧数据库文件权限。 */
   static async open(path: string) {
-    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    // SQLite 创建 WAL/SHM 时沿用数据库权限，首次建库前就限制为仅当前用户可读写。
-    try {
-      await (await open(path, 'ax', 0o600)).close();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const isMemory =
+      path === ':memory:' ||
+      (path.startsWith('file:') && (path.includes('mode=memory') || path.includes(':memory:')));
+    if (!isMemory) {
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      // SQLite 创建 WAL/SHM 时沿用数据库权限，首次建库前就限制为仅当前用户可读写。
+      try {
+        await (await open(path, 'ax', 0o600)).close();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
     }
     const store = new SqliteStore(path);
     try {
       await store.list('meta');
-      for (const suffix of ['', '-wal', '-shm']) {
-        try {
-          await chmod(path + suffix, 0o600);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (!isMemory) {
+        for (const suffix of ['', '-wal', '-shm']) {
+          try {
+            await chmod(path + suffix, 0o600);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
         }
       }
       return store;
@@ -147,7 +154,7 @@ export class SqliteStore {
     }
   }
 
-  /** 无条件写入便捷入口；需要防止覆盖并发修改时，调用 commit 并显式提供 checks。 */
+  /** 无条件写入便携入口；需要防止覆盖并发修改时，调用 commit 并显式提供 checks。 */
   async put<T extends Entity>(kind: string, entity: T) {
     await this.commit({ puts: [row(kind, entity)] });
   }

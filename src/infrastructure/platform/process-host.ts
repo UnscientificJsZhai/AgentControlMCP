@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { delimiter, dirname, join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import { AppError, fail } from '../../domain/errors.js';
 import { normalizeEnvironment, resolveEnvironment } from './environment.js';
+import { npmShimCommand } from '../installers/npm-entry.js';
 
 export async function which(
   command: string,
@@ -47,19 +48,11 @@ export async function executableCommand(
   if (platform !== 'win32' || !/\.cmd$/i.test(executable)) return { executable, args };
   // 只解析 npm 的已知 shim；绝不将任意 argv 拼接给 cmd.exe。
   const script = await readFile(executable, 'utf8');
-  const match =
-    /(?:%dp0%[\\/]|%~dp0[\\/]?)node_modules[\\/]npm[\\/]bin[\\/](npm-cli|npx-cli)\.js/i.exec(
-      script,
-    );
-  if (!match) return fail('CONFIG_INVALID', '无法安全执行 .cmd；请显式指定解释器和脚本参数。');
-  const entry = join(dirname(executable), 'node_modules/npm/bin', `${match[1]!.toLowerCase()}.js`);
-  await access(entry, constants.R_OK).catch(() =>
+  const resolved = npmShimCommand(executable, script, args);
+  await access(resolved.args[0]!, constants.R_OK).catch(() =>
     fail('DEPENDENCY_MISSING', 'npm 启动脚本对应的 JS 入口不存在。'),
   );
-  return {
-    executable: process.execPath,
-    args: [entry, ...args],
-  };
+  return resolved;
 }
 
 export interface LaunchSpec {

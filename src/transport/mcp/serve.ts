@@ -1,5 +1,5 @@
 import { createServer as httpServer } from 'node:http';
-import type { Server as HttpServer } from 'node:http';
+import type { IncomingMessage, ServerResponse, Server as HttpServer } from 'node:http';
 import { once } from 'node:events';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { serveStdio, StdioServerTransport } from '@modelcontextprotocol/server/stdio';
@@ -8,6 +8,7 @@ import type { Container } from '../../bootstrap/container.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import { createServer } from './server.js';
 import type { Toolset } from './catalog.js';
+import type { Settings } from '../../domain/schemas.js';
 
 /** stdio 以稳定客户端标识归属数据；输入结束意味着该服务实例结束，需回收下游资源。 */
 export function startStdio(app: Container, clientId: string, toolset: Toolset = 'collaboration') {
@@ -53,6 +54,38 @@ export function validateHttpOptions(options: HttpOptions) {
     fail('CONFIG_INVALID', '监听端口无效。');
 }
 
+/** 请求入口检查独立于监听和身份认证，便于在读取正文前拒绝非法来源。 */
+export function httpRequestGuard(
+  options: HttpOptions,
+  settings: Pick<Settings, 'allowedHosts' | 'allowedOrigins'>,
+) {
+  // 监听通配地址不等于接受任意 Host；显式白名单限制非预期主机名访问。
+  const allowedHosts = [
+    ...new Set([
+      'localhost',
+      '127.0.0.1',
+      '[::1]',
+      options.host === '::1' ? '[::1]' : options.host,
+      ...settings.allowedHosts,
+    ]),
+  ].filter((host) => host !== '0.0.0.0' && host !== '::');
+  const checkHost = hostHeaderValidation(allowedHosts);
+  return (req: IncomingMessage, res: ServerResponse) => {
+    if (!checkHost(req, res)) return false;
+    if (req.url?.split('?')[0] !== '/mcp') {
+      res.writeHead(404);
+      res.end();
+      return false;
+    }
+    if (req.headers.origin && !settings.allowedOrigins.includes(req.headers.origin)) {
+      res.writeHead(403);
+      res.end('Origin is not allowed');
+      return false;
+    }
+    return true;
+  };
+}
+
 /** HTTP 容器独立于单次连接存活；每个请求重新认证，共享持久化任务与本实例活动资源。 */
 export async function startHttp(
   app: Container,
@@ -75,30 +108,10 @@ export async function startHttp(
     },
   );
   const nodeHandler = toNodeHandler(handler);
-  // 监听通配地址不等于接受任意 Host；显式白名单用于限制非预期主机名访问。
-  const allowedHosts = [
-    ...new Set([
-      'localhost',
-      '127.0.0.1',
-      '[::1]',
-      options.host === '::1' ? '[::1]' : options.host,
-      ...app.settings.allowedHosts,
-    ]),
-  ].filter((host) => host !== '0.0.0.0' && host !== '::');
-  const checkHost = hostHeaderValidation(allowedHosts);
+  const guard = httpRequestGuard(options, app.settings);
   const server = httpServer((req, res) => {
     void (async () => {
-      if (!checkHost(req, res)) return;
-      if (req.url?.split('?')[0] !== '/mcp') {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-      if (req.headers.origin && !app.settings.allowedOrigins.includes(req.headers.origin)) {
-        res.writeHead(403);
-        res.end('Origin is not allowed');
-        return;
-      }
+      if (!guard(req, res)) return;
       // 在读取请求正文前拒绝无效身份；正文仍按实际接收字节限制，不能只信任请求头。
       if (options.noAuth)
         await app.identities.registerAnonymous(String(req.headers['x-agent-client-id'] ?? ''));

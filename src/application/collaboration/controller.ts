@@ -83,7 +83,10 @@ export class CollaborationController {
   stopping = false;
   revokeBridge: (agentId: string) => Promise<void> = async () => {};
 
-  constructor(readonly app: CollaborationDependencies) {
+  constructor(
+    readonly app: CollaborationDependencies,
+    private readonly taskMessageMaxBytes = 16 * 1024 ** 2 - 8192,
+  ) {
     this.sessions = app.tasks.sessions;
     this.runtimes = this.sessions.runtimes;
     this.operations = this.sessions.operations;
@@ -436,7 +439,7 @@ export class CollaborationController {
       { type: 'text', text: message },
       ...(criteria ? [{ type: 'text', text: JSON.stringify(criteria) }] : []),
     ];
-    if (bytes(blocks) > 16 * 1024 ** 2 - 8192)
+    if (bytes(blocks) > this.taskMessageMaxBytes)
       fail('CONFIG_INVALID', '任务正文与完成条件合计过大；序列化后必须小于 16 MiB 减 8 KiB。');
   }
 

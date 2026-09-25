@@ -1,5 +1,16 @@
-import { basename } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fail } from '../../domain/errors.js';
+
+/** 解析已知 npm shim 为参数数组；入口存在性仍由进程适配器检查。 */
+export function npmShimCommand(executable: string, script: string, args: string[]) {
+  const match =
+    /(?:%dp0%[\\/]|%~dp0[\\/]?)node_modules[\\/]npm[\\/]bin[\\/](npm-cli|npx-cli)\.js/i.exec(
+      script,
+    );
+  if (!match) return fail('CONFIG_INVALID', '无法安全执行 .cmd；请显式指定解释器和脚本参数。');
+  const entry = join(dirname(executable), 'node_modules/npm/bin', `${match[1]!.toLowerCase()}.js`);
+  return { executable: process.execPath, args: [entry, ...args] };
+}
 
 /** 只解析参数，不执行 shell；不支持 env 的变量替换和其他环境修改选项。 */
 function words(line: string) {

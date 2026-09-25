@@ -18,9 +18,12 @@ import { completionRows } from './collaboration/store.js';
 import type { ManagedAgentRecord } from '../domain/collaboration.js';
 
 /** 只有 ESRCH 视为已退出；权限错误或其他不确定情况按仍存活处理，避免错误抢占资源。 */
-export function isAlive(pid: number) {
+export function isAlive(
+  pid: number,
+  probe: (pid: number, signal: 0) => unknown = (pid, signal) => process.kill(pid, signal),
+) {
   try {
-    process.kill(pid, 0);
+    probe(pid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
@@ -31,11 +34,12 @@ export function isAlive(pid: number) {
  * 只修复已确认退出的实例：将未完成工作标为 interrupted，释放占用并封口事件段。
  * 恢复数据库状态不等于恢复下游执行，不重发 prompt、认证或其他结果未知的操作。
  */
-export async function recover(store: SqliteStore) {
+export async function recover(
+  store: Pick<SqliteStore, 'list' | 'get' | 'commit'>,
+  alive: (pid: number) => boolean = isAlive,
+) {
   const instances = await store.list<InstanceRecord>('instance');
-  const dead = instances.filter(
-    (instance) => instance.state === 'active' && !isAlive(instance.pid),
-  );
+  const dead = instances.filter((instance) => instance.state === 'active' && !alive(instance.pid));
   for (const instance of dead) {
     const puts: Row[] = [
       row('instance', { ...instance, revision: instance.revision + 1, state: 'stopped' }),
@@ -184,7 +188,7 @@ export async function recover(store: SqliteStore) {
   return {
     recoveredInstances: dead.map((instance) => instance.id),
     uncertainInstances: instances
-      .filter((instance) => instance.state === 'active' && isAlive(instance.pid))
+      .filter((instance) => instance.state === 'active' && alive(instance.pid))
       .map((instance) => instance.id),
   };
 }

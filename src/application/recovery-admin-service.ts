@@ -25,12 +25,13 @@ export class RecoveryAdminService {
       instanceId: string;
       serviceId: string;
     },
+    private readonly alive: (pid: number) => boolean = isAlive,
   ) {}
 
   /** 管理诊断隐藏握手 nonce；进程存活只是观测结果，不证明 PID 仍对应原实例。 */
   async inspect() {
     const instances = (await this.app.store.list<InstanceRecord>('instance')).map(
-      ({ nonce: _nonce, ...item }) => ({ ...item, processAlive: isAlive(item.pid) }),
+      ({ nonce: _nonce, ...item }) => ({ ...item, processAlive: this.alive(item.pid) }),
     );
     return {
       instances,
@@ -57,12 +58,12 @@ export class RecoveryAdminService {
     const instance = await this.app.store.get<InstanceRecord>('instance', args.instanceId!);
     if (!instance) fail('OBJECT_NOT_FOUND', '实例不存在。');
     if (instance.revision !== args.expectedRevision) fail('REVISION_CONFLICT', '实例修订已变化。');
-    if (isAlive(instance.pid))
+    if (this.alive(instance.pid))
       fail(
         'RECOVERY_CONFLICT',
         '进程仍存在或身份无法确认；请通过原实例管理入口停止后重试，不抢占租约。',
       );
-    return recover(this.app.store);
+    return recover(this.app.store, this.alive);
   }
 
   /**

@@ -5,13 +5,19 @@ import { AppError, fail } from '../../domain/errors.js';
 import { id } from '../../domain/ids.js';
 import { checkedPath } from './file-callbacks.js';
 import { ProcessHost } from './process-host.js';
+import type { LaunchSpec } from './process-host.js';
 import { normalizeEnvironment } from './environment.js';
 import type { OperationDescription } from '../../domain/permission-policy.js';
+
+type TerminalHost = Pick<
+  ProcessHost,
+  'stdout' | 'stderr' | 'closed' | 'stop' | 'exitCode' | 'exitSignal'
+>;
 
 interface Terminal {
   id: string;
   runtimeId: string;
-  host: ProcessHost;
+  host: TerminalHost;
   output: string;
   bytes: number;
   limit: number;
@@ -30,6 +36,13 @@ export class TerminalManager {
   private readonly terminals = new Map<string, Terminal>();
   private readonly pending = new Set<PendingTerminal>();
   private readonly closing = new Map<string, Promise<void>>();
+
+  constructor(
+    private readonly platform: {
+      checkedPath: typeof checkedPath;
+      start: (spec: LaunchSpec) => Promise<TerminalHost>;
+    } = { checkedPath, start: (spec) => ProcessHost.start(spec) },
+  ) {}
 
   async create(
     runtimeId: string,
@@ -61,7 +74,7 @@ export class TerminalManager {
       abort = () => reject(signal.reason as AppError);
       signal.addEventListener('abort', abort, { once: true });
     });
-    let host: ProcessHost | undefined;
+    let host: TerminalHost | undefined;
     try {
       const command = {
         executable: request.command,
@@ -72,7 +85,10 @@ export class TerminalManager {
       };
       // 审批只包含请求覆盖项；实际环境在等待审批前快照，不公开宿主继承值。
       const targetEnv = { ...normalizeEnvironment(env), ...command.env };
-      const cwd = await Promise.race([checkedPath(request.cwd ?? roots[0]!, roots), cancelled]);
+      const cwd = await Promise.race([
+        this.platform.checkedPath(request.cwd ?? roots[0]!, roots),
+        cancelled,
+      ]);
       signal.throwIfAborted();
       await Promise.race([
         authorize({ operation: 'execute', paths: [cwd], command }, signal),
@@ -80,7 +96,7 @@ export class TerminalManager {
       ]);
       signal.throwIfAborted();
       // 启动后不能直接放弃 Promise：关闭必须等句柄返回，再回收尚未发布的进程。
-      host = await ProcessHost.start({
+      host = await this.platform.start({
         executable: command.executable,
         args: command.args,
         cwd,

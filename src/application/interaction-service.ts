@@ -50,6 +50,10 @@ export class InteractionService {
     readonly store: SqliteStore,
     readonly runtimes: RuntimeService,
     readonly tasks: TaskService,
+    private readonly paths: {
+      checkedPath: typeof checkedPath;
+      realpath: (path: string) => Promise<string>;
+    } = { checkedPath, realpath },
   ) {}
 
   async get(ctx: Context, interactionId: string, control = false) {
@@ -105,7 +109,7 @@ export class InteractionService {
     const paths: string[] = [];
     for (const path of description.paths) {
       try {
-        paths.push(await checkedPath(path, roots, description.operation === 'write'));
+        paths.push(await this.paths.checkedPath(path, roots, description.operation === 'write'));
       } catch {
         return 'ask' as const;
       }
@@ -115,7 +119,9 @@ export class InteractionService {
       rules: await Promise.all(
         runtime.snapshot.permissionPolicy.rules.map(async (rule) => ({
           ...rule,
-          roots: await Promise.all(rule.roots.map((root) => realpath(root).catch(() => root))),
+          roots: await Promise.all(
+            rule.roots.map((root) => this.paths.realpath(root).catch(() => root)),
+          ),
         })),
       ),
     };
@@ -134,7 +140,9 @@ export class InteractionService {
           rules: await Promise.all(
             parentPolicy.rules.map(async (rule) => ({
               ...rule,
-              roots: await Promise.all(rule.roots.map((root) => realpath(root).catch(() => root))),
+              roots: await Promise.all(
+                rule.roots.map((root) => this.paths.realpath(root).catch(() => root)),
+              ),
             })),
           ),
         };

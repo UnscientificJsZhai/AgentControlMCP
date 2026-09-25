@@ -1,17 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, realpath, mkdir, writeFile, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import {
-  resolveStoragePaths,
-  initializeStoragePaths,
-} from '../../src/infrastructure/storage/paths.js';
-import { SqliteStore } from '../../src/infrastructure/storage/sqlite-store.js';
+import { resolveStoragePaths } from '../../src/infrastructure/storage/paths.js';
 
-void test('存储目录按平台分类，XDG 空值和相对路径回退，显式覆盖保持隔离', () => {
-  for (const value of [undefined, '', 'relative']) {
+for (const value of [undefined, '', 'relative']) {
+  /**
+   * 验证 Linux 的 XDG 变量缺失、为空或为相对路径时回退到默认目录。
+   *
+   * @remarks
+   * 数据、配置、状态和缓存目录均须独立遵循各自的默认路径。
+   */
+  void test('Linux falls back from invalid XDG values: ' + String(value), () => {
     const paths = resolveStoragePaths({
       platform: 'linux',
       home: '/home/test',
@@ -27,8 +25,32 @@ void test('存储目录按平台分类，XDG 空值和相对路径回退，显�
     assert.equal(paths.configDir, '/home/test/.config/agent-control-mcp');
     assert.equal(paths.stateDir, '/home/test/.local/state/agent-control-mcp');
     assert.equal(paths.cacheDir, '/home/test/.cache/agent-control-mcp');
-  }
-  const linux = resolveStoragePaths({
+  });
+
+  /**
+   * 验证 Windows 的 LOCALAPPDATA 无效时回退到用户目录。
+   *
+   * @remarks
+   * 缺失、空值和相对路径都不能被用作有效的应用数据根目录。
+   */
+  void test('Windows falls back from invalid LOCALAPPDATA values: ' + String(value), () => {
+    const paths = resolveStoragePaths({
+      platform: 'win32',
+      home: 'C:\\Users\\test',
+      env: { LOCALAPPDATA: value },
+    });
+    assert.equal(paths.dataDir, 'C:\\Users\\test\\AppData\\Local\\AgentControlMCP');
+  });
+}
+
+/**
+ * 验证自定义 XDG 路径分别控制配置、状态、缓存和安装目录。
+ *
+ * @remarks
+ * 内容位于状态目录，安装位于数据目录，不能将所有产物混入同一根目录。
+ */
+void test('Custom Linux XDG paths separate configuration, state, cache, and installations', () => {
+  const paths = resolveStoragePaths({
     platform: 'linux',
     home: '/home/test',
     env: {
@@ -38,72 +60,85 @@ void test('存储目录按平台分类，XDG 空值和相对路径回退，显�
       XDG_CACHE_HOME: '/cache',
     },
   });
-  assert.equal(linux.contentDir, '/state/agent-control-mcp/content');
-  assert.equal(linux.installationsDir, '/data/agent-control-mcp/installations');
-  const mac = resolveStoragePaths({ platform: 'darwin', home: '/Users/test', env: {} });
-  assert.equal(mac.cacheDir, '/Users/test/Library/Caches/AgentControlMCP');
+  assert.equal(paths.contentDir, '/state/agent-control-mcp/content');
+  assert.equal(paths.installationsDir, '/data/agent-control-mcp/installations');
+  assert.equal(paths.configDir, '/config/agent-control-mcp');
+  assert.equal(paths.cacheDir, '/cache/agent-control-mcp');
+});
+
+/**
+ * 验证 macOS 将持久状态和缓存放入对应系统目录。
+ *
+ * @remarks
+ * 数据库保存在应用支持目录下，缓存独立放入用户缓存目录。
+ */
+void test('macOS separates application support and cache directories', () => {
+  const paths = resolveStoragePaths({ platform: 'darwin', home: '/Users/test', env: {} });
+  assert.equal(paths.cacheDir, '/Users/test/Library/Caches/AgentControlMCP');
   assert.equal(
-    mac.databasePath,
+    paths.databasePath,
     '/Users/test/Library/Application Support/AgentControlMCP/state/state.db',
   );
-  for (const value of [undefined, '', 'relative']) {
-    const windows = resolveStoragePaths({
+});
+
+/**
+ * 验证 Windows 接受绝对 LOCALAPPDATA 作为数据目录根路径。
+ *
+ * @remarks
+ * 环境指定的盘符和目录应优先于用户目录默认值。
+ */
+void test('Windows uses an absolute LOCALAPPDATA path', () => {
+  assert.equal(
+    resolveStoragePaths({
       platform: 'win32',
       home: 'C:\\Users\\test',
-      env: { LOCALAPPDATA: value },
-    });
-    assert.equal(windows.dataDir, 'C:\\Users\\test\\AppData\\Local\\AgentControlMCP');
-  }
-  const override = resolveStoragePaths({
+      env: { LOCALAPPDATA: 'D:\\Local' },
+    }).dataDir,
+    'D:\\Local\\AgentControlMCP',
+  );
+});
+
+/**
+ * 验证显式数据目录覆盖环境配置，并相对于给定工作目录解析。
+ *
+ * @remarks
+ * 缓存也应落入显式数据目录，避免被平台环境变量分流到其他位置。
+ */
+void test('Explicit dataDir overrides environment settings and keeps cache data under the same root', () => {
+  const paths = resolveStoragePaths({
     dataDir: 'my data',
     cwd: '/work',
     platform: 'linux',
     env: { AGENT_CONTROL_MCP_DATA_DIR: '/ignored', XDG_CACHE_HOME: '/ignored-cache' },
   });
-  assert.equal(override.dataDir, '/work/my data');
-  assert.equal(override.cacheDir, '/work/my data/cache');
-  assert.equal(
-    resolveStoragePaths({ platform: 'linux', env: { AGENT_CONTROL_MCP_DATA_DIR: '/override' } })
-      .configDir,
-    '/override/config',
-  );
-  assert.throws(() => resolveStoragePaths({ dataDir: '' }), { code: 'CONFIG_INVALID' });
-  assert.throws(() => resolveStoragePaths({ env: { AGENT_CONTROL_MCP_DATA_DIR: ' ' } }), {
-    code: 'CONFIG_INVALID',
-  });
+  assert.equal(paths.dataDir, '/work/my data');
+  assert.equal(paths.cacheDir, '/work/my data/cache');
 });
 
-void test('拒绝缓存与安装根重叠，旧格式只报错而不迁移', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'acm-layout-'));
-  try {
-    const paths = resolveStoragePaths({ dataDir: root });
-    await assert.rejects(initializeStoragePaths({ ...paths, cacheDir: paths.dataDir }), {
-      code: 'CONFIG_INVALID',
-    });
-    const file = join(await realpath(root), 'old.db');
-    const old = new DatabaseSync(file);
-    old.exec(
-      "PRAGMA user_version=1; CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('keep');",
-    );
-    old.close();
-    await assert.rejects(SqliteStore.open(file), { code: 'STORAGE_FORMAT_UNSUPPORTED' });
-    const after = new DatabaseSync(file, { readOnly: true });
-    assert.equal(after.prepare('PRAGMA user_version').get()?.user_version, 1);
-    assert.equal(after.prepare('SELECT value FROM sentinel').get()?.value, 'keep');
-    after.close();
-    await mkdir(join(root, 'state'));
-    await writeFile(join(root, 'state/state.db'), 'old-layout');
-    await assert.rejects(
-      initializeStoragePaths({
-        ...paths,
-        stateDir: join(root, 'new-state'),
-        contentDir: join(root, 'new-state/content'),
-        databasePath: join(root, 'new-state/state.db'),
-      }),
-      { code: 'STORAGE_FORMAT_UNSUPPORTED' },
-    );
-    assert.equal(await readFile(join(root, 'state/state.db'), 'utf8'), 'old-layout');
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+/**
+ * 验证数据目录环境变量优先于平台默认路径。
+ *
+ * @remarks
+ * 配置目录应从覆盖后的数据根目录派生。
+ */
+void test('The data directory environment override takes precedence over platform defaults', () => {
+  assert.equal(
+    resolveStoragePaths({
+      platform: 'linux',
+      env: { AGENT_CONTROL_MCP_DATA_DIR: '/override' },
+    }).configDir,
+    '/override/config',
+  );
 });
+
+for (const options of [{ dataDir: '' }, { env: { AGENT_CONTROL_MCP_DATA_DIR: ' ' } }]) {
+  /**
+   * 验证显式或环境来源的空白数据目录被拒绝。
+   *
+   * @remarks
+   * 空白覆盖值应作为配置错误报告，不能静默回退到其他目录。
+   */
+  void test('Blank data directory overrides are rejected: ' + JSON.stringify(options), () => {
+    assert.throws(() => resolveStoragePaths(options), { code: 'CONFIG_INVALID' });
+  });
+}

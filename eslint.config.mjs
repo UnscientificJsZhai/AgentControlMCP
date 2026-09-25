@@ -78,5 +78,42 @@ export default defineConfig([
       ],
     },
   },
+  {
+    files: ['test/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            ...[
+              'child_process',
+              'fs',
+              'fs/promises',
+              'http',
+              'https',
+              'net',
+              'tls',
+              'dgram',
+              'worker_threads',
+              'sqlite',
+            ].flatMap((name) =>
+              [name, 'node:' + name].map((name) => ({
+                name,
+                allowTypeImports: true,
+                message: '单元测试不能直接访问磁盘、数据库、网络或启动进程；请注入内存替身。',
+              })),
+            ),
+          ],
+          patterns: [
+            {
+              group: ['**/bootstrap/container.js', '**/storage/sqlite-store.js'],
+              allowTypeImports: true,
+              message: '单元测试只引用容器和存储的类型，不启动真实服务或 SQLite Worker。',
+            },
+          ],
+        },
+      ],
+    },
+  },
   eslintConfigPrettier,
 ]);
