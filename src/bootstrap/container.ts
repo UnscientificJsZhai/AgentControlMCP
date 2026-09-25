@@ -353,12 +353,20 @@ export class Container {
       }
       case 'terminal/create': {
         if (!this.settings.terminals) fail('CAPABILITY_UNSUPPORTED', '终端已禁用。');
+        // 会话读取期间 Runtime 可能已关闭；复核后同步进入终端预约，避免迟到回调重建资源。
+        if (this.runtimes.live.get(runtimeId) !== handle)
+          fail('DOWNSTREAM_EXITED', 'Runtime 已停止。');
         return this.terminals.create(
           runtimeId,
           params as acp.CreateTerminalRequest,
           handle.spec.env,
           roots,
-          (description) => this.interactions.host(runtimeId, description, signal),
+          (description, creationSignal) =>
+            this.interactions.host(
+              runtimeId,
+              description,
+              AbortSignal.any([signal, creationSignal]),
+            ),
         );
       }
       case 'terminal/output':
