@@ -17,6 +17,8 @@ export default defineConfig([
     '.vscode/**',
     '.eslintcache',
     '**/*.tsbuildinfo',
+    'experiments/**/{.tools,.local,data,logs}/**',
+    'experiments/**/workspace/output/**',
   ]),
   {
     linterOptions: {

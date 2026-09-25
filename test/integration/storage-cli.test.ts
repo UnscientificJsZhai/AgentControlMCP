@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { Container } from '../../src/bootstrap/container.js';
 import type { StoragePaths } from '../../src/infrastructure/storage/paths.js';
 import { startAdmin, adminRequest } from '../../src/transport/admin/ipc.js';
@@ -18,12 +18,14 @@ void test('CLI 与库使用同一覆盖目录，socket、数据库权限和运�
   });
   try {
     const paths = app.paths;
+    assert.ok(isAbsolute(paths.runtimeDir));
+    assert.ok((await lstat(paths.runtimeDir)).isDirectory());
     await startAdmin(app);
     const response = await adminRequest(app.instance, 'connector_info', {});
     assert.ok(response.data);
     await app.close();
+    await assert.rejects(lstat(paths.runtimeDir), { code: 'ENOENT' });
     if (process.platform !== 'win32') {
-      await assert.rejects(lstat(paths.runtimeDir), { code: 'ENOENT' });
       assert.equal((await lstat(paths.databasePath)).mode & 0o777, 0o600);
     }
     const { stdout } = await promisify(execFile)(
@@ -35,8 +37,9 @@ void test('CLI 与库使用同一覆盖目录，socket、数据库权限和运�
     for (const key of Object.keys(paths) as (keyof StoragePaths)[])
       if (key !== 'runtimeDir') assert.equal(fromCli[key], paths[key]);
     assert.equal(fromCli.dataDir, await realpath(join(root, 'data')));
-    if (process.platform !== 'win32')
-      await assert.rejects(lstat(fromCli.runtimeDir), { code: 'ENOENT' });
+    assert.ok(isAbsolute(fromCli.runtimeDir));
+    assert.notEqual(fromCli.runtimeDir, paths.runtimeDir);
+    await assert.rejects(lstat(fromCli.runtimeDir), { code: 'ENOENT' });
     const usage = await promisify(execFile)(
       process.execPath,
       [cli, 'storage', 'usage', '--data-dir', 'data'],
