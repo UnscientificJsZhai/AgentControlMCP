@@ -10,3 +10,10 @@ out-tsc/
 .eslintcache
 *.tsbuildinfo
 package-lock.json
+experiments/**/.tools/
+experiments/**/.local/
+experiments/**/data/
+experiments/**/logs/
+experiments/**/workspace/.codex/
+experiments/**/workspace/output/
+experiments/**/workspace/run-context.json

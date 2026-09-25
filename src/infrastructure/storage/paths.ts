@@ -130,9 +130,8 @@ function validateStorageRoots(paths: StoragePaths) {
     }
 }
 
-/** socket 使用独享的短目录；无效 XDG runtime 回退，日志只进入 stderr。 */
+/** 每个实例独享运行目录，存放 Bridge 绑定文件和 POSIX socket；无效 XDG runtime 回退。 */
 export async function createRuntimeDirectory(paths: StoragePaths) {
-  if (process.platform === 'win32') return '';
   let base = paths.runtimeDir;
   if (process.platform === 'linux') {
     let valid = false;
@@ -151,7 +150,7 @@ export async function createRuntimeDirectory(paths: StoragePaths) {
     }
   }
   const directory = await mkdtemp(path.join(base, 'acm-'));
-  if (Buffer.byteLength(path.join(directory, 'admin.sock')) > 100) {
+  if (process.platform !== 'win32' && Buffer.byteLength(path.join(directory, 'admin.sock')) > 100) {
     await rm(directory, { recursive: true, force: true });
     fail('CONFIG_INVALID', '运行目录过长，请设置较短的 TMPDIR 或 XDG_RUNTIME_DIR。');
   }
