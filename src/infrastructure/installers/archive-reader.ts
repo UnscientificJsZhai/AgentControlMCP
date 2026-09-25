@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve, relative } from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Parser } from 'tar';
+import type { ReadEntry } from 'tar';
 import yauzl from 'yauzl';
 import type { Entry, ZipFile } from 'yauzl';
 import unbzip2 from 'unbzip2-stream';
@@ -112,9 +113,41 @@ export async function extractArchive(
     });
   } else {
     const pending: Promise<void>[] = [];
+    const activeEntries = new Set<ReadEntry>();
+    const writes = new AbortController();
+    const source = createReadStream(file);
+    const sourceClosed = new Promise<void>((resolve) => source.once('close', resolve));
+    const decompressor = /\.(tar\.bz2|tbz2)$/i.test(new URL(url).pathname) ? unbzip2() : undefined;
+    let failure: Error | undefined;
+    let complete!: () => void;
+    const done = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    const stop = (error: unknown) => {
+      if (failure) return;
+      failure = error instanceof Error ? error : new Error('归档解压失败');
+      source.unpipe();
+      source.destroy();
+      decompressor?.destroy();
+      parser.abort(failure);
+      // Parser.abort 不会结束条目流，必须同时取消写入，才能等待所有任务收敛。
+      writes.abort(failure);
+      for (const entry of activeEntries) entry.destroy();
+      complete();
+    };
+    const track = (task: Promise<unknown>) => {
+      // 立即消费每个拒绝；保留首个错误，等所有任务退出后再交给调用方。
+      pending.push(task.then(() => {}, stop));
+    };
     const parser = new Parser({
       strict: true,
       onReadEntry(entry) {
+        if (failure) {
+          entry.destroy();
+          return;
+        }
+        activeEntries.add(entry);
+        entry.once('end', () => activeEntries.delete(entry));
         try {
           if (entry.type === 'Directory' && ['.', './'].includes(entry.path)) {
             entry.resume();
@@ -122,7 +155,7 @@ export async function extractArchive(
           }
           const target = reserve(entry.path, entry.size);
           if (entry.type === 'Directory') {
-            pending.push(mkdir(target, { recursive: true, mode: 0o700 }).then(() => {}));
+            track(mkdir(target, { recursive: true, mode: 0o700 }));
             entry.resume();
           } else if (entry.type === 'SymbolicLink' || entry.type === 'Link') {
             const source = resolve(
@@ -136,54 +169,50 @@ export async function extractArchive(
             entry.type === 'OldFile' ||
             entry.type === 'ContiguousFile'
           ) {
-            const written = mkdir(dirname(target), { recursive: true, mode: 0o700 }).then(
-              async () => {
+            track(
+              (async () => {
+                await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+                writes.signal.throwIfAborted();
                 await pipeline(
                   entry,
                   createWriteStream(target, {
                     flags: 'wx',
                     mode: entry.mode && entry.mode & 0o111 ? 0o700 : 0o600,
                   }),
-                  { signal },
+                  { signal: writes.signal },
                 );
-              },
-            );
-            pending.push(written);
-            void written.catch((error: unknown) =>
-              parser.abort(error instanceof Error ? error : new Error('归档写入失败')),
+              })(),
             );
           } else {
             entry.resume();
             fail('ARCHIVE_UNSAFE', '归档包含不支持的特殊文件。');
           }
         } catch (error) {
-          parser.abort(error instanceof Error ? error : new Error('归档无效'));
+          stop(error);
         }
       },
     });
-    const done = new Promise<void>((resolve, reject) => {
-      parser.on('end', resolve);
-      parser.on('error', reject);
-    });
-    const source = createReadStream(file);
-    const abort = () => {
-      source.destroy(new Error('cancelled'));
-      parser.abort(new Error('cancelled'));
-    };
+    parser.on('end', complete);
+    parser.on('error', stop);
+    source.on('error', stop);
+    decompressor?.on('error', stop);
+    const abort = () => stop(signal.reason);
     signal.addEventListener('abort', abort, { once: true });
-    source.on('error', (error) => parser.abort(error));
-    if (/\.(tar\.bz2|tbz2)$/i.test(new URL(url).pathname)) {
-      const decompressor = unbzip2();
-      decompressor.on('error', (error) => parser.abort(error));
-      source.pipe(decompressor).pipe(parser);
-    } else source.pipe(parser);
     try {
+      if (signal.aborted) abort();
+      else if (decompressor) source.pipe(decompressor).pipe(parser);
+      else source.pipe(parser);
       await done;
-      await Promise.all(pending);
+    } catch (error) {
+      stop(error);
     } finally {
-      signal.removeEventListener('abort', abort);
+      await Promise.all(pending);
       source.destroy();
+      decompressor?.destroy();
+      await sourceClosed;
+      signal.removeEventListener('abort', abort);
     }
+    if (failure) throw failure;
   }
   // 同时检查链接声明位置和目标真实路径，覆盖通过另一条符号链接间接逃逸的情况。
   for (const entry of links) {
