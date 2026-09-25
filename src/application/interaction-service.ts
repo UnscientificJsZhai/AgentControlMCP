@@ -172,6 +172,8 @@ export class InteractionService {
         (policy === 'allow_once' ? 'allow_once' : policy === 'deny' ? 'reject_once' : ''),
     );
     if (option) return { outcome: { outcome: 'selected', optionId: option.optionId } };
+    // 缺少拒绝选项也必须兑现 deny，不能降为可批准的待处理交互。
+    if (policy === 'deny') return { outcome: { outcome: 'cancelled' } };
     return this.open(runtimeId, 'permission', request, signal, requestId);
   }
 
