@@ -38,6 +38,7 @@ control.on('data', (chunk) => {
     executable: string;
     args: string[];
     cwd: string;
+    env: NodeJS.ProcessEnv;
   };
   const command =
     process.platform === 'win32'
@@ -52,7 +53,8 @@ control.on('data', (chunk) => {
   // POSIX 下创建独立进程组，确保向下游树发信号时不会终止连接器自身。
   child = spawn(command, args, {
     cwd: config.cwd,
-    env: process.env,
+    // Windows 原生宿主也接收目标环境，再由 CreateProcessW 继承给实际命令。
+    env: config.env,
     stdio: 'pipe',
     detached: process.platform !== 'win32',
     windowsHide: true,

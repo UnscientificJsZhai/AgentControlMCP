@@ -5,6 +5,7 @@ import { fail } from '../../domain/errors.js';
 import { id } from '../../domain/ids.js';
 import { checkedPath } from './file-callbacks.js';
 import { ProcessHost } from './process-host.js';
+import { normalizeEnvironment } from './environment.js';
 import type { OperationDescription } from '../../domain/permission-policy.js';
 
 interface Terminal {
@@ -35,20 +36,26 @@ export class TerminalManager {
         4
     )
       fail('CAPACITY_EXCEEDED', '已达到终端数量上限。');
+    const command = {
+      executable: request.command,
+      args: [...(request.args ?? [])],
+      env: normalizeEnvironment(
+        Object.fromEntries((request.env ?? []).map((entry) => [entry.name, entry.value])),
+      ),
+    };
+    // 审批只包含请求覆盖项；实际环境在等待审批前快照，不公开宿主继承值。
+    const targetEnv = { ...normalizeEnvironment(env), ...command.env };
     const cwd = await checkedPath(request.cwd ?? roots[0]!, roots);
     await authorize({
       operation: 'execute',
       paths: [cwd],
-      command: { executable: request.command, args: request.args ?? [] },
+      command,
     });
     const host = await ProcessHost.start({
-      executable: request.command,
-      args: request.args ?? [],
+      executable: command.executable,
+      args: command.args,
       cwd,
-      env: {
-        ...env,
-        ...Object.fromEntries((request.env ?? []).map((entry) => [entry.name, entry.value])),
-      },
+      env: targetEnv,
     });
     const terminal: Terminal = {
       id: id('term'),

@@ -5,6 +5,7 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import { AppError, fail } from '../../domain/errors.js';
+import { normalizeEnvironment, resolveEnvironment } from './environment.js';
 
 export async function which(
   command: string,
@@ -85,11 +86,11 @@ export class ProcessHost {
   private readonly startup: Promise<number>;
   private stopped = false;
 
-  private constructor(spec: LaunchSpec) {
+  private constructor(spec: LaunchSpec, supervisorEnv: NodeJS.ProcessEnv) {
     this.process = spawn(
       process.execPath,
       [fileURLToPath(new URL('./supervisor.js', import.meta.url))],
-      { env: spec.env, stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'], windowsHide: true },
+      { env: supervisorEnv, stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'], windowsHide: true },
     );
     this.stdout = this.process.stdout!;
     this.stdin = this.process.stdin!;
@@ -128,14 +129,15 @@ export class ProcessHost {
         if (data.error) rejectStartup(new Error('spawn_failed'));
       }
     });
-    this.control.write(
-      JSON.stringify({ executable: spec.executable, args: spec.args, cwd: spec.cwd }) + '\n',
-    );
+    // 目标环境只经私有控制管道传递，不能影响 supervisor 的 Node 启动参数或动态加载。
+    this.control.write(JSON.stringify(spec) + '\n');
   }
 
   static async start(spec: LaunchSpec) {
-    const resolved = await executableCommand(spec.executable, spec.args, spec.env);
-    const host = new ProcessHost({ ...spec, ...resolved });
+    const env = normalizeEnvironment(spec.env);
+    const resolved = await executableCommand(spec.executable, spec.args, env);
+    const supervisor = await resolveEnvironment({ values: {}, inherit: [] });
+    const host = new ProcessHost({ ...spec, ...resolved, env }, supervisor.env);
     let timer: NodeJS.Timeout | undefined;
     try {
       host.pid = await Promise.race([

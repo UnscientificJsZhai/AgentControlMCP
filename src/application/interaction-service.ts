@@ -15,7 +15,7 @@ import type { OperationDescription } from '../domain/permission-policy.js';
 import type { PermissionPolicy } from '../domain/schemas.js';
 import { decide } from '../domain/permission-policy.js';
 import { checkedPath, inside } from '../infrastructure/platform/file-callbacks.js';
-import { redact } from '../infrastructure/platform/environment.js';
+import { normalizeEnvironment, redact } from '../infrastructure/platform/environment.js';
 import type { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { row } from '../infrastructure/storage/sqlite-store.js';
 import type { RuntimeService } from './runtime-service.js';
@@ -25,6 +25,12 @@ import { idem, Serial } from './common.js';
 export type PermissionDecision =
   { kind: 'acp_option'; optionId: string } | { kind: 'cancel' } | { kind: 'host'; allow: boolean };
 
+interface PendingInteraction {
+  resolve: (value: unknown) => void;
+  timer?: NodeJS.Timeout;
+  description?: OperationDescription;
+}
+
 /**
  * 将下游权限请求及表单交互转为可查询的持久化记录，同时在原连接上等待答复。
  * 决策先落盘再交付，实例退出或连接代次变化后不能把旧答复发送给新连接。
@@ -33,10 +39,7 @@ export class InteractionService {
   inheritedPolicies: (
     session: SessionRecord,
   ) => Promise<{ policy: PermissionPolicy; roots: string[] }[]> = () => Promise.resolve([]);
-  private readonly pending = new Map<
-    string,
-    { resolve: (value: unknown) => void; timer?: NodeJS.Timeout }
-  >();
+  private readonly pending = new Map<string, PendingInteraction>();
   private readonly receipts = new Map<
     string,
     { interactionId: string; principalId: string; digest: string }
@@ -116,8 +119,12 @@ export class InteractionService {
         })),
       ),
     };
-    const own = decide(policy, { ...description, paths }, (path, ruleRoots) =>
-      (ruleRoots.length ? ruleRoots : roots).some((root) => inside(root, path)),
+    const own = decide(
+      policy,
+      { ...description, paths },
+      (path, ruleRoots) =>
+        (ruleRoots.length ? ruleRoots : roots).some((root) => inside(root, path)),
+      normalizeEnvironment,
     );
     const inherited = await this.inheritedPolicies(session);
     const results = await Promise.all(
@@ -131,8 +138,12 @@ export class InteractionService {
             })),
           ),
         };
-        return decide(normalized, { ...description, paths }, (path, ruleRoots) =>
-          (ruleRoots.length ? ruleRoots : parentRoots).some((root) => inside(root, path)),
+        return decide(
+          normalized,
+          { ...description, paths },
+          (path, ruleRoots) =>
+            (ruleRoots.length ? ruleRoots : parentRoots).some((root) => inside(root, path)),
+          normalizeEnvironment,
         );
       }),
     );
@@ -214,6 +225,28 @@ export class InteractionService {
     )
       fail('CAPACITY_EXCEEDED', '待处理交互过多。');
     const timeout = runtime.snapshot.permissionPolicy.timeoutMs;
+    const description =
+      type === 'host_permission'
+        ? structuredClone(request as unknown as OperationDescription)
+        : undefined;
+    const publicRequest = description?.command?.env
+      ? {
+          ...description,
+          command: {
+            ...description.command,
+            env: Object.fromEntries(
+              Object.entries(description.command.env).map(([name, value]) => [
+                name,
+                /token|secret|password|passwd|credential|api.?key|private.?key|access.?key|cookie|authorization/i.test(
+                  name,
+                )
+                  ? '[REDACTED]'
+                  : value,
+              ]),
+            ),
+          },
+        }
+      : request;
     const record: InteractionRecord = {
       id: id('int'),
       revision: 1,
@@ -228,13 +261,14 @@ export class InteractionService {
       ...(requestId !== null ? { requestId } : {}),
       type,
       state: 'pending',
-      request: redact(request, handle.secrets),
+      request: redact(publicRequest, handle.secrets),
       expiresAt: timeout ? new Date(Date.now() + timeout).toISOString() : null,
       channel: handle.channel,
     };
     await this.store.put('interaction', record);
     const result = new Promise<unknown>((resolve) => {
-      const entry: { resolve: (value: unknown) => void; timer?: NodeJS.Timeout } = { resolve };
+      // 委托审批复核原始语义；脱敏后的公开值不能替代实际 env 参与策略匹配。
+      const entry: PendingInteraction = { resolve, ...(description ? { description } : {}) };
       if (timeout)
         entry.timer = setTimeout(() => {
           void this.end(record.id, 'expired');
@@ -339,7 +373,7 @@ export class InteractionService {
       if (call.kind === 'read' && call.locations?.length)
         description = { operation: 'read', paths: call.locations.map((l) => l.path) };
     } else if (record.type === 'host_permission')
-      description = record.request as unknown as OperationDescription;
+      description = this.pending.get(record.id)?.description ?? null;
     return (await this.policy(runtimeId, description)) === 'allow_once';
   }
 

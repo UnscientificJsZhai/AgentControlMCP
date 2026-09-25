@@ -26,7 +26,13 @@ export const policyRule = z.strictObject({
   effect: z.enum(['allow_once', 'ask', 'deny']),
   operations: z.array(z.enum(['read', 'write', 'delete', 'execute'])).min(1),
   roots: z.array(absolutePath),
-  command: z.strictObject({ executable: text, args: z.array(z.string()) }).optional(),
+  command: z
+    .strictObject({
+      executable: text,
+      args: z.array(z.string()),
+      env: z.record(text, z.string()).optional(),
+    })
+    .optional(),
 });
 export const permissionPolicy = z
   .strictObject({

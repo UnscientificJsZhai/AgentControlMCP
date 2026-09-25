@@ -18,6 +18,19 @@ const windows = [
   'TMP',
 ];
 
+/** Windows 环境名不区分大小写，合并前统一名称，避免 Node 选中旧的同名键。 */
+export function normalizeEnvironment<T extends string | undefined>(
+  env: Record<string, T>,
+  platform = process.platform,
+): Record<string, T> {
+  return Object.fromEntries(
+    Object.entries(env).map(([key, value]) => [
+      platform === 'win32' ? key.toUpperCase() : key,
+      value,
+    ]),
+  );
+}
+
 /** 解析最小 KEY=VALUE 格式，只去掉成对引号；不执行 shell、不展开变量或转义表达式。 */
 export function parseEnvFile(source: string): Record<string, string> {
   const values: Record<string, string> = {};
@@ -79,9 +92,7 @@ export async function resolveEnvironment(
   const env: Record<string, string> = {};
   const secrets: string[] = [];
   const normalize = (key: string) => (process.platform === 'win32' ? key.toUpperCase() : key);
-  const source = Object.fromEntries(
-    Object.entries(host).map(([key, value]) => [normalize(key), value]),
-  );
+  const source = normalizeEnvironment(host);
   for (const key of [...(process.platform === 'win32' ? windows : posix), ...config.inherit]) {
     const value = source[normalize(key)];
     if (value !== undefined) env[normalize(key)] = value;
