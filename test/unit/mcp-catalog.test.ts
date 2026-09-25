@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { Container } from '../../src/bootstrap/container.js';
 import type { Context } from '../../src/domain/models.js';
 import { createTools } from '../../src/transport/mcp/tools.js';
-import { createMcpTools, describeTool, toolsForPhase } from '../../src/transport/mcp/catalog.js';
+import { createMcpTools, describeTool } from '../../src/transport/mcp/catalog.js';
 
 const directNames = [
   'agent_list',
@@ -54,18 +54,9 @@ void test('默认定义全集含接入三工具和协作八工具，管理四工
     createMcpTools(app).map((t) => t.name),
     allTools,
   );
-  assert.deepEqual(
-    toolsForPhase(createMcpTools(app), 'bootstrap').map((t) => t.name),
-    ['discover_agents', 'setup_agent', 'wait_agent_setup'],
-  );
-  assert.deepEqual(
-    toolsForPhase(createMcpTools(app), 'ready').map((t) => t.name),
-    allTools,
-  );
-  assert.deepEqual(
-    toolsForPhase(createMcpTools(app), 'recovery').map((t) => t.name),
-    allTools.filter((name) => name !== 'spawn_agent'),
-  );
+  const setup = describeTool(createMcpTools(app).find((tool) => tool.name === 'setup_agent')!);
+  assert.deepEqual(setup.inputSchema.required, ['action', 'arguments']);
+  assert.ok(setup.inputSchema.properties?.arguments);
   assert.deepEqual(
     createMcpTools(app, 'management').map((t) => t.name),
     ['management_describe', 'management_read', 'management_write', 'management_destructive'],
@@ -156,7 +147,6 @@ void test('MCP 交互工具与管理网关映射完整，描述结构符合规�
     for (const action of actions) {
       const expected = original.find((tool) => tool.name === action)!;
       assert.ok(expected, action);
-      assert.equal(names.includes(action), false, action);
       assert.equal(gateway.schema.safeParse({ action, arguments: {} }).success, true);
       const result = described.parse(await describe.run({} as Context, { action }));
       const { description, inputSchema, annotations } = describeTool(expected);

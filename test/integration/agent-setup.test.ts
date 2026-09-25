@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { writeFile, rm } from 'node:fs/promises';
-import { createMcpTools, toolsForPhase } from '../../src/transport/mcp/catalog.js';
+import { createMcpTools } from '../../src/transport/mcp/catalog.js';
 import { invoke } from '../../src/transport/mcp/tools.js';
 import { agentConfig } from '../../src/domain/schemas.js';
 import type { WorkRecord, InstallationRecord, ConfigRecord } from '../../src/domain/models.js';
@@ -253,33 +253,40 @@ void test(
   },
 );
 
-void test('安装器失败不发布 profile 或开放协作工具', { timeout: 40_000 }, async () => {
-  const h = await setupHarness();
-  try {
-    h.failDownloads();
-    const accepted = await h.app.setup.install(h.app.admin, {
-      ...h.target,
-      profile: agentConfig.omit({ origin: true, launch: true }).parse(h.profile),
-      idempotencyKey: 'failed-download',
-    });
-    const failed = await until(async () => {
-      const value = await h.app.operations.get(h.app.admin, accepted.operationId);
-      return terminalStates.has(value.state) ? value : null;
-    }, 30_000);
-    assert.equal(failed.state, 'failed');
-    assert.equal((await h.app.configs.list()).length, 0);
-    assert.equal((await h.app.installations.list()).length, 0);
-    const phase = h.app.availability.phase(h.app.admin, await h.app.availability.snapshot());
-    assert.equal(phase, 'bootstrap');
-    assert.equal(
-      toolsForPhase(createMcpTools(h.app), phase).some((t) => t.name === 'spawn_agent'),
-      false,
-    );
-    assert.equal(h.downloads, 1);
-  } finally {
-    await h.cleanup();
-  }
-});
+void test(
+  '安装器失败不发布 profile，固定目录中的创建工具仍拒绝执行',
+  { timeout: 40_000 },
+  async () => {
+    const h = await setupHarness();
+    try {
+      h.failDownloads();
+      const accepted = await h.app.setup.install(h.app.admin, {
+        ...h.target,
+        profile: agentConfig.omit({ origin: true, launch: true }).parse(h.profile),
+        idempotencyKey: 'failed-download',
+      });
+      const failed = await until(async () => {
+        const value = await h.app.operations.get(h.app.admin, accepted.operationId);
+        return terminalStates.has(value.state) ? value : null;
+      }, 30_000);
+      assert.equal(failed.state, 'failed');
+      assert.equal((await h.app.configs.list()).length, 0);
+      assert.equal((await h.app.installations.list()).length, 0);
+      const phase = h.app.availability.phase(h.app.admin, await h.app.availability.snapshot());
+      assert.equal(phase, 'bootstrap');
+      const response = await invoke(h.app, createMcpTools(h.app), h.app.admin, 'spawn_agent', {
+        requestId: 'after-failed-install',
+        taskName: 'blocked',
+        message: '不能隐式接入',
+      });
+      assert.equal(response.ok, false);
+      if (!response.ok) assert.equal(response.error.code, 'AGENT_SETUP_REQUIRED');
+      assert.equal(h.downloads, 1);
+    } finally {
+      await h.cleanup();
+    }
+  },
+);
 
 void test('本地复用重新绑定新指纹，并原子提交成功事件和配置', { timeout: 40_000 }, async () => {
   const h = await setupHarness();

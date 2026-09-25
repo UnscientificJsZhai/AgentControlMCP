@@ -2,6 +2,28 @@ import type { Context, Entity, WorkRecord } from './models.js';
 import type { ErrorDetail } from './errors.js';
 
 export const collaborationSchemaVersion = 1;
+/** Bridge 工具使用独立前缀，避免与宿主的原生协作工具混淆。 */
+export const collaborationBridge = {
+  serverName: 'agent_collaboration',
+  toolPrefix: 'acm_',
+} as const;
+
+export interface CompletionCriteria {
+  configId?: string | undefined;
+  requiredMessage?: { target: '/root'; text: string } | undefined;
+}
+
+export interface AcceptanceResult {
+  status: 'not_requested' | 'passed' | 'failed';
+  checks: { name: string; passed: boolean }[];
+}
+
+export interface BridgeCallEvidence {
+  callId: string;
+  tool: string;
+  outcome: 'started' | 'succeeded' | 'failed';
+  messageId?: string;
+}
 export type AgentState =
   | 'starting'
   | 'running'
@@ -53,6 +75,7 @@ export interface TaskIntentRecord extends Entity {
   agentId: string;
   order: string;
   message: string;
+  completionCriteria?: CompletionCriteria;
   state: 'queued' | 'dispatched' | 'settled';
   taskId?: string;
   /** 此轮携带的邮箱末尾；只有确实进入派发后才推进成员游标。 */
@@ -69,6 +92,8 @@ export interface MessageRecord extends Entity {
   from: string;
   agentId: string;
   type: MessageType;
+  channel?: 'agent_collaboration' | 'external' | 'framework';
+  textDigest?: string;
   body: unknown;
   intentId?: string;
   taskId?: string;
@@ -98,10 +123,18 @@ export interface AgentView {
   teamId: string;
   path: string;
   parentId: string;
+  configId: string;
+  configRevision: number;
   state: AgentState;
   queuedTasks: number;
   bridge: ManagedAgentRecord['bridge'];
-  lastRun: { intentId: string; taskId?: string; state: string; stopReason?: string } | null;
+  lastRun: {
+    intentId: string;
+    taskId?: string;
+    state: string;
+    stopReason?: string;
+    acceptance?: AcceptanceResult;
+  } | null;
 }
 
 export function inSubtree(parent: string, child: string) {

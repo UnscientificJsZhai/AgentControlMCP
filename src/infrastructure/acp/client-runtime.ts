@@ -10,6 +10,7 @@ import type {
   InitializeResponse,
 } from '@agentclientprotocol/sdk';
 import { Readable, Writable, Transform } from 'node:stream';
+import { setImmediate } from 'node:timers/promises';
 import { AppError, fail } from '../../domain/errors.js';
 import { ProcessHost } from '../platform/process-host.js';
 import type { LaunchSpec } from '../platform/process-host.js';
@@ -235,7 +236,15 @@ export class ClientRuntime {
 
   /** 等待当前通知队列并传播其失败，供任务终态提交前显式同步。 */
   async barrier() {
-    await this.notifications;
+    // SDK 逐个 await 通知路由，却同步完成响应；先排空已接收帧的分发微任务，
+    // 让通知进入持久化队列。这里按事件循环阶段同步，不依赖固定毫秒延迟。
+    await setImmediate();
+    // 等待过程中 SDK 还可能追加已收到的通知，直到队列引用稳定才能提交终态。
+    for (;;) {
+      const pending = this.notifications;
+      await pending;
+      if (pending === this.notifications) break;
+    }
     if (this.notificationError)
       throw this.notificationError instanceof Error
         ? this.notificationError

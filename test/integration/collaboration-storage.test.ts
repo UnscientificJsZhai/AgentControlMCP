@@ -25,7 +25,9 @@ void test('恢复受理原子保存公开响应，失败可重试且不同请求
       taskName: 'restore',
       message: 'once',
     });
-    await until(async () => (await c.view(await c.agent(member.agentId))).state === 'idle');
+    await until(async () =>
+      (await c.storage.intents(member.agentId)).some((intent) => intent.state === 'settled'),
+    );
     await h.app.runtimes.closeNow((await c.agent(member.agentId)).runtimeId!);
     await until(
       async () => (await c.view(await c.agent(member.agentId))).state === 'needs_recovery',

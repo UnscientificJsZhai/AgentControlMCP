@@ -40,6 +40,7 @@ export class AgentSetupService {
       phase: this.availability.phase(ctx, snapshot),
       profiles: snapshot.profiles.map(({ record, availability }) => ({
         profile: record.id,
+        configId: record.id,
         name: record.config.name,
         revision: record.revision,
         ...availability,
@@ -59,7 +60,7 @@ export class AgentSetupService {
       ),
       ...(args.local ? { local: await this.local.scan(args.local.paths) } : {}),
       guidance:
-        '优先接入现有 Agent。无可用 profile 时，请让用户选择；只有用户明确指定安装目标（含 ACP 适配器）才调用 setup_agent 的 install/apply_local。无 Registry 缓存时可显式 refresh_registry。',
+        'AgentControlMCP 已连接，工具目录固定。空 profiles 表示尚未配置。优先接入现有 Agent；只有用户明确指定安装目标（含 ACP 适配器）才调用 setup_agent 的 install/apply_local。setup_agent 参数为 {action, arguments: {...}}，可省略整个 permissionPolicy 使用默认策略。注册成功后直接将 configId 传给 spawn_agent.profile；新增失败不能用旧配置冒充。无 Registry 缓存时可显式 refresh_registry。',
     };
   }
 
@@ -144,7 +145,7 @@ export class AgentSetupService {
       phase: this.availability.phase(ctx, snapshot),
       nextAction:
         operation.state === 'completed'
-          ? '接入操作已完成。请重新拉取 MCP tools/list；用 discover_agents 确认 profile 后创建成员。'
+          ? '接入操作已结束。涉及注册时必须核对 result.configId 与 discover_agents 中的 profile，再用该 configId 创建成员并核对成员绑定；无需刷新工具目录或重连。'
           : (operation.error?.nextAction ??
             '使用本 operationId 继续等待；需要停止时调用 setup_agent cancel。'),
     };

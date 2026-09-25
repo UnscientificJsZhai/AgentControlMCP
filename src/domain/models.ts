@@ -12,6 +12,8 @@ export interface Context {
   nativeInteraction?: boolean;
   /** 仅专用 Bridge 验证后建立的调用身份，绝不从工具参数接收。 */
   collaborationMember?: { teamId: string; agentId: string };
+  /** Bridge 收到调用时固定的任务归属；排队或长调用结束后不能归入下一轮。 */
+  collaborationCall?: { taskId?: string; intentId?: string };
   /** 调度器内部通行证，旧会话入口不能自行控制托管会话。 */
   managedAgentId?: string;
   collaborationIntent?: { teamId: string; agentId: string; intentId: string; mailAfter: string };

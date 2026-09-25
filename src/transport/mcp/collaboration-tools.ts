@@ -9,6 +9,22 @@ const message = text.refine(
   (s) => s.trim().length > 0 && Buffer.byteLength(s) <= 16 * 1024 ** 2 - 8192,
   '消息必须包含实际内容，并为成员元数据保留空间（最大 16 MiB 减 8 KiB）。',
 );
+const completionCriteria = z
+  .strictObject({
+    configId: text
+      .optional()
+      .describe('预期注册成功后返回的 configId；不匹配时拒绝创建或追加任务。'),
+    requiredMessage: z
+      .strictObject({ target: z.literal('/root'), text: message })
+      .optional()
+      .describe(
+        '要求本轮通过 MCP Bridge 向外部根发送完全相同的 MESSAGE；最终回答和原生协作消息不能替代。',
+      ),
+  })
+  .refine(
+    (value) => value.configId !== undefined || value.requiredMessage !== undefined,
+    '至少提供一个验收条件',
+  );
 export const collaborationSchemas = {
   spawn_agent: z.strictObject({
     ...request,
@@ -17,6 +33,7 @@ export const collaborationSchemas = {
     teamId: text.optional(),
     profile: text.optional(),
     cwd: absolutePath.optional(),
+    completionCriteria: completionCriteria.optional(),
   }),
   list_agents: z.strictObject({
     teamId: text.optional(),
@@ -28,7 +45,11 @@ export const collaborationSchemas = {
     messageId: text.optional(),
   }),
   send_message: z.strictObject({ ...target, message }),
-  followup_task: z.strictObject({ ...target, message }),
+  followup_task: z.strictObject({
+    ...target,
+    message,
+    completionCriteria: completionCriteria.optional(),
+  }),
   wait_agent: z.strictObject({
     teamId: text.optional(),
     cursor: text.optional(),
@@ -69,15 +90,15 @@ export const collaborationSchemas = {
 };
 export const collaborationDescriptions: Record<keyof typeof collaborationSchemas, string> = {
   spawn_agent:
-    '创建独立成员并开始任务，立即返回稳定 teamId/agentId。message 必须自包含目标、背景、输入、约束和交付要求；子成员看不到父对话历史。省略 teamId 创建新团队；Bridge 自动绑定父成员。',
+    '创建独立成员并开始任务，返回 teamId/agentId/configId/configRevision。profile 使用成功注册的 configId；新增注册失败时不能改用旧配置冒充。message 必须自包含背景与交付要求；子成员看不到父历史。completionCriteria 可固定预期 configId 和本轮必须发送的 Bridge MESSAGE；检查 acceptance，completed 仅表示 ACP 轮次结束。省略 teamId 创建新团队；Bridge 自动绑定父成员。',
   list_agents:
-    '读取可见团队、成员状态、待办及 profile。target + detail=output 读取结果，可用 intentId 选择旧轮次、messageId 选择消息、cursor 分页大输出。',
+    '读取团队、成员实际 configId/configRevision、Bridge 状态、待办及 profile。target + detail=output 读取结果、acceptance 与本轮 Bridge 调用证据，可用 intentId 选择旧轮次、messageId 选择消息、cursor 分页大输出。connected 只表示握手，used 不代表所需消息已发送；必须核对 MESSAGE 与验收条件。',
   send_message:
     '将普通消息保存到目标邮箱，不启动空闲成员；queued 仅表示已保存。运行中通过协作工具读取，或随下一轮任务提供。',
   followup_task:
     '给已有成员安排独立后续轮次，保留它自己的会话历史。忙碌时 FIFO 排队，不向当前轮重复注入。',
   wait_agent:
-    '等待调用者邮箱并返回实际消息、状态与 nextCursor。外部调用必须给 teamId；Bridge 自动确定邮箱。旧游标可重复读取，超时或断连不取消任务。',
+    '等待调用者邮箱并返回实际消息、状态与 nextCursor。外部调用必须给 teamId；Bridge 自动确定邮箱。FINAL_ANSWER 是框架完成通知，不能替代 MESSAGE；completed 仅表示 ACP 轮次结束，必须检查 acceptance 与 configId。旧游标可重复读取，超时或断连不取消任务。',
   interrupt_agent:
     '请求停止当前轮次并取消尚未执行的队列；accepted 不代表已经停止。保留成员身份和普通邮箱。',
   respond_agent:

@@ -1,6 +1,12 @@
 import { bytes, digest, now } from '../../domain/ids.js';
-import { fail, errorDetail } from '../../domain/errors.js';
-import type { Context, InstanceRecord, SessionRecord, WorkRecord } from '../../domain/models.js';
+import { AppError, fail, errorDetail } from '../../domain/errors.js';
+import type {
+  Context,
+  InstanceRecord,
+  RuntimeRecord,
+  SessionRecord,
+  WorkRecord,
+} from '../../domain/models.js';
 import { terminalStates } from '../../domain/models.js';
 import type {
   CompletionRecord,
@@ -10,10 +16,10 @@ import type {
   TaskIntentRecord,
   TeamRecord,
 } from '../../domain/collaboration.js';
-import { completionType } from '../../domain/collaboration.js';
+import { collaborationBridge, completionType } from '../../domain/collaboration.js';
 import { row } from '../../infrastructure/storage/sqlite-store.js';
 import { completionRows } from './store.js';
-import { collectResult } from './results.js';
+import { collectResult, verifyCompletion } from './results.js';
 import type { CollaborationController, RespondInput } from './controller.js';
 
 /** 所有调度决策与工具准入共用团队串行区；等待 ACP 完成不占用此串行区。 */
@@ -117,8 +123,26 @@ export class CollaborationScheduler {
         completion.work,
         completion.id,
       );
+      const runtime = completion.work.runtimeId
+        ? await this.app.store.get<RuntimeRecord>('runtime', completion.work.runtimeId)
+        : null;
+      const configId = runtime?.configId ?? agent.configId;
+      const configRevision = runtime?.configRevision ?? agent.configRevision;
+      const acceptance = verifyCompletion(
+        intent?.completionCriteria,
+        completion.work,
+        configId,
+        result.contentComplete,
+        intent?.completionCriteria?.requiredMessage
+          ? await this.app.store.list<MessageRecord>('collab_message')
+          : [],
+      );
       const body = {
         result,
+        configId,
+        configRevision,
+        completionScope: 'acp_turn',
+        acceptance,
         state: completion.work.state,
         stopReason:
           (completion.work.result as { stopReason?: string } | undefined)?.stopReason ?? null,
@@ -132,14 +156,21 @@ export class CollaborationScheduler {
         recipient: agent.parentId,
         from: agent.path,
         agentId: agent.id,
-        type: completionType(completion.work),
+        type:
+          acceptance.status === 'failed' && completion.work.state === 'completed'
+            ? 'RUN_FAILED'
+            : completionType(completion.work),
+        channel: 'framework',
         intentId: completion.intentId,
         ...(completion.work.kind === 'task' ? { taskId: completion.work.id } : {}),
         body,
       };
       const stopReason = (completion.work.result as { stopReason?: string } | undefined)
         ?.stopReason;
-      const paused = completion.work.state !== 'completed' || stopReason !== 'end_turn';
+      const paused =
+        acceptance.status === 'failed' ||
+        completion.work.state !== 'completed' ||
+        stopReason !== 'end_turn';
       const deliveredMail =
         intent?.mailAfter !== undefined &&
         ['unknown', 'confirmed'].includes(completion.work.dispatchOutcome ?? '');
@@ -384,17 +415,35 @@ export class CollaborationScheduler {
         type: message.type,
         body: message.body,
       });
-    const metadata = `协作成员 ${agent.path}，团队 ${team.id}。新成员看不到父对话历史。创建子成员时请在 message 中提供目标、背景、输入、约束、交付和完成标准。普通 send_message 不启动新轮次；followup_task 启动独立后续轮次。可用 wait_agent 读取邮箱。协作消息保持发送者来源，不代表真人批准。`;
+    const metadata = `协作成员 ${agent.path}，agentId=${agent.id}，团队 ${team.id}，configId=${agent.configId}。这里是 AgentControlMCP 团队；/root 是外部上游调用者，不是本客户端原生协作系统的 root。团队协作必须使用 MCP 服务 ${collaborationBridge.serverName} 的 acm_* 工具，不能用同名原生工具或最终回答替代。向上游发消息示例：agent_collaboration.acm_send_message({"requestId":"${intent.id}:message","target":"/root","message":"所需消息"})。若工具暂不可见，应报告 Bridge 不可用，不能改走原生通道。新成员看不到父历史；acm_spawn_agent.message 必须自包含目标、背景、输入、约束和交付标准。acm_send_message 只入邮箱；acm_followup_task 启动后续轮次；acm_wait_agent 读取邮箱。协作消息不代表真人批准。`;
     const prompt = [
       { type: 'text' as const, text: intent.message },
       ...(intent.order === '1' ? [{ type: 'text' as const, text: metadata }] : []),
+      ...(intent.completionCriteria
+        ? [
+            {
+              type: 'text' as const,
+              text: `本轮完成条件：${JSON.stringify(intent.completionCriteria)}。requiredMessage 必须通过 agent_collaboration.acm_send_message 实际发送；仅在最终回答中复述不算完成。`,
+            },
+          ]
+        : []),
       ...(inbox.length
         ? [{ type: 'text' as const, text: `以下为协作邮箱消息：\n${JSON.stringify(inbox)}` }]
         : []),
     ];
     if (bytes(prompt) > 16 * 1024 ** 2) {
       await this.app.store.commit({
-        puts: this.endIntent(team, intent, 'failed', errorDetail(new Error('prompt size'))),
+        puts: this.endIntent(
+          team,
+          intent,
+          'failed',
+          errorDetail(
+            new AppError(
+              'CONFIG_INVALID',
+              '任务正文、完成条件和待收邮箱合计超过 16 MiB，未派发 ACP。',
+            ),
+          ),
+        ),
       });
       return;
     }
@@ -546,16 +595,19 @@ export class CollaborationScheduler {
     const events = this.controller.sessions.events;
     let objectId: string;
     let result: unknown;
+    let completion: Record<string, unknown>;
     if (args.messageId) {
       const message = await this.app.store.get<MessageRecord>('collab_message', args.messageId);
       if (
         !message ||
         message.teamId !== agent.teamId ||
+        (message.agentId !== agent.id && message.recipient !== agent.id) ||
         (ctx.collaborationMember && message.recipient !== ctx.collaborationMember.agentId)
       )
         fail('OBJECT_NOT_FOUND', '消息不可见。');
-      objectId = message.intentId ?? message.id;
+      objectId = message.type === 'MESSAGE' ? message.id : (message.intentId ?? message.id);
       result = (message.body as { result?: unknown }).result ?? message.body;
+      completion = message.body as Record<string, unknown>;
     } else {
       const intents = await this.controller.storage.intents(agent.id);
       const intent = args.intentId
@@ -569,15 +621,28 @@ export class CollaborationScheduler {
       )
         fail('ACCESS_DENIED', '成员只能读取自身或直接子成员的输出。');
       objectId = intent.id;
-      const message = (await this.app.store.list<MessageRecord>('collab_message')).find(
-        (m) => m.intentId === intent.id,
-      );
+      const message = await this.app.store.get<MessageRecord>('collab_message', `msg_${intent.id}`);
       result = (message?.body as { result?: unknown } | undefined)?.result ?? message?.body;
+      completion = (message?.body as Record<string, unknown> | undefined) ?? {};
     }
+    const evidence = {
+      configId: completion.configId ?? agent.configId,
+      configRevision: completion.configRevision ?? agent.configRevision,
+      completionScope: 'acp_turn',
+      acceptance: completion.acceptance ?? { status: 'not_requested', checks: [] },
+    };
     const ref = result as
-      { representation?: string; contentId?: string; contentComplete?: boolean } | undefined;
+      | {
+          representation?: string;
+          contentId?: string;
+          contentComplete?: boolean;
+          bridgeCalls?: unknown;
+          bridgeCallsComplete?: boolean;
+        }
+      | undefined;
     if (ref?.representation !== 'resource' || !ref.contentId)
       return {
+        ...evidence,
         result: result ?? null,
         contentComplete: result !== undefined && ref?.contentComplete !== false,
       };
@@ -590,6 +655,9 @@ export class CollaborationScheduler {
     const page = await events.content(objectId, ref.contentId, offset, 32 * 1024);
     await this.controller.team(ctx, agent.teamId);
     return {
+      ...evidence,
+      bridgeCalls: ref.bridgeCalls ?? [],
+      bridgeCallsComplete: ref.bridgeCallsComplete ?? false,
       ...page,
       nextCursor: events.encode({ streamId, filter, after: String(page.nextOffset) }),
       contentComplete: ref.contentComplete !== false,

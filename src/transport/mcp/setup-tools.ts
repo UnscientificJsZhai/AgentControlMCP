@@ -6,8 +6,6 @@ import type { ToolDefinition } from './tools.js';
 import { fail } from '../../domain/errors.js';
 import { idem } from '../../application/common.js';
 
-export const setupToolNames = new Set(['discover_agents', 'setup_agent', 'wait_agent_setup']);
-
 /** 精简接入门面复用原管理契约，不将任意内部操作透传给默认协作入口。 */
 export function createSetupTools(app: Container): ToolDefinition[] {
   const operations = createTools(app);
@@ -31,15 +29,19 @@ export function createSetupTools(app: Container): ToolDefinition[] {
     action,
     definition: operations.find((tool) => tool.name === name)!,
   }));
-  const setupSchema = z.union([
-    z.strictObject({ action: z.literal('install'), arguments: installSchema }),
-    ...delegates.map(({ action, definition }) =>
-      z.strictObject({
-        action: z.literal(action),
-        arguments: definition.schema,
-      }),
-    ),
-  ]);
+  const envelope = z.strictObject({
+    action: z.enum(['install', ...delegates.map(({ action }) => action)]),
+    arguments: z.record(z.string(), z.unknown()),
+  });
+  // 顶层始终是 action + arguments；公开分支说明，执行时只检查所选 action。
+  const setupSchema = envelope.extend({
+    arguments: z.union([
+      installSchema.describe('action=install 的参数'),
+      ...delegates.map(({ action, definition }) =>
+        definition.schema.describe(`action=${action} 的参数`),
+      ),
+    ]),
+  });
   const discoverSchema = z.strictObject({
     sourceId: text.optional(),
     query: z.string().optional(),
@@ -70,14 +72,20 @@ export function createSetupTools(app: Container): ToolDefinition[] {
       readOnly: false,
       destructive: false,
       description:
-        '显式接入 Agent：install 安装固定目标并注册 profile；register/update 接入或配置现有程序；refresh_registry 刷新候选；plan_local/apply_local 复用 Codex；cancel 取消 operation。install/apply_local（含 ACP 适配器）只能在用户明确授权目标后调用，不能因任务需要、空环境或失败自行安装。长操作返回 operationId，使用 wait_agent_setup 查询。',
+        '显式接入 Agent，参数必须嵌套为 {action, arguments}。最小注册示例：{"action":"register","arguments":{"config":{"name":"my-agent","origin":{"kind":"manual"},"launch":{"kind":"command","executable":"/absolute/path/to/acp-agent","args":[]}},"idempotencyKey":"register-my-agent"}}。permissionPolicy 可整体省略；提供时必须包含 rules（每条含 id/effect/operations/roots）、fallback="ask"、timeoutMs（允许 null，不能漏填）。install 安装并注册；update 修改；refresh_registry 刷新候选；plan_local/apply_local 复用 Codex；cancel 取消 operation。install/apply_local（含 ACP 适配器）只能在用户明确授权目标后调用。长操作返回 operationId，使用 wait_agent_setup 查询。注册失败不得改用旧 profile 宣称新增成功；注册成功后将返回的 configId 用作 spawn_agent.profile。',
       run: async (ctx, input) => {
-        const args = setupSchema.parse(input);
+        const args = envelope.parse(input);
         if (ctx.collaborationMember) fail('ACCESS_DENIED', '下游成员不能管理 Agent 安装或配置。');
-        if (args.action === 'install')
-          return app.setup.install(ctx, installSchema.parse(args.arguments));
+        if (args.action === 'install') {
+          const parsed = z
+            .strictObject({ action: z.literal('install'), arguments: installSchema })
+            .parse(input);
+          return app.setup.install(ctx, parsed.arguments);
+        }
         const target = delegates.find((item) => item.action === args.action)!;
-        const value = target.definition.schema.parse(args.arguments) as Record<string, unknown>;
+        const value = z
+          .strictObject({ action: z.literal(args.action), arguments: target.definition.schema })
+          .parse(input).arguments as Record<string, unknown>;
         if (args.action === 'register' || args.action === 'update') {
           const replay = await app.store.replay(
             idem(ctx, target.definition.name, value as { idempotencyKey: string }, null),
@@ -105,7 +113,7 @@ export function createSetupTools(app: Container): ToolDefinition[] {
       destructive: false,
       openWorld: false,
       description:
-        '等待接入 operation 的进度或终态，复用归属校验。成功后重新拉取 tools/list 获取完整协作工具；下载成功但未注册不表示已就绪。',
+        '等待接入 operation 的进度或终态，复用归属校验。注册成功后核对 result.configId，再直接创建成员，无需刷新工具；下载成功但未注册不表示已就绪。',
       run: (ctx, input) => app.setup.wait(ctx, waitSchema.parse(input)),
     },
   ];

@@ -7,6 +7,7 @@ import type {
   MessageRecord,
   TeamRecord,
   TaskIntentRecord,
+  AcceptanceResult,
 } from '../../domain/collaboration.js';
 import type { SqliteStore } from '../../infrastructure/storage/sqlite-store.js';
 import { row } from '../../infrastructure/storage/sqlite-store.js';
@@ -163,11 +164,29 @@ export class CollaborationStore {
         `${teamId}:${message.recipient}`,
       );
       if (BigInt(message.seq) > BigInt(ack?.after ?? '0')) continue;
+      const summary = message.body as {
+        configId?: string;
+        configRevision?: number;
+        acceptance?: AcceptanceResult;
+      };
       await this.db.put('collab_message', {
         ...message,
         revision: message.revision + 1,
-        body: { purged: true, contentComplete: false },
+        body: {
+          purged: true,
+          contentComplete: false,
+          ...(message.channel === 'framework' && summary.acceptance
+            ? {
+                configId: summary.configId,
+                configRevision: summary.configRevision,
+                completionScope: 'acp_turn',
+                acceptance: summary.acceptance,
+              }
+            : {}),
+        },
       });
+      // 普通消息即使关联任务，外置正文仍归属于 messageId。
+      if (message.type === 'MESSAGE') units.add(message.id);
       if (message.intentId) {
         const remaining = (await this.db.list<MessageRecord>('collab_message')).some(
           (m) => m.intentId === message.intentId && !(m.body as { purged?: boolean }).purged,
@@ -181,6 +200,7 @@ export class CollaborationStore {
         await this.db.put('collab_intent', {
           ...intent,
           message: '',
+          completionCriteria: undefined,
           revision: intent.revision + 1,
         });
     }
