@@ -8,10 +8,11 @@ import { once } from 'node:events';
 import { z } from 'zod';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { Container } from '../../bootstrap/container.js';
-import type { Context, RuntimeRecord } from '../../domain/models.js';
+import type { Context, RuntimeRecord, SessionRecord, WorkRecord } from '../../domain/models.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import type { TeamRecord } from '../../domain/collaboration.js';
-import { digest } from '../../domain/ids.js';
+import { collaborationBridge } from '../../domain/collaboration.js';
+import { digest, id } from '../../domain/ids.js';
 import { createCollaborationTools } from '../mcp/collaboration-tools.js';
 
 export const bindingSchema = z.strictObject({ endpoint: z.string(), token: z.string() });
@@ -119,7 +120,7 @@ export class CollaborationIpc {
     this.app.runtimes.handle(runtime).secrets.push(token);
     return [
       {
-        name: 'agent_collaboration',
+        name: collaborationBridge.serverName,
         command: process.execPath,
         args: [
           fileURLToPath(new URL('../../cli/entry.js', import.meta.url)),
@@ -163,11 +164,45 @@ export class CollaborationIpc {
     const definition = createCollaborationTools(this.app).find((tool) => tool.name === name);
     if (!definition) fail('ACCESS_DENIED', 'Bridge 仅提供协作工具。');
     const member = ctx.collaborationMember!;
+    const agent = await this.app.collaboration.agent(member.agentId);
+    // 固定调用开始时的任务归属，长等待跨轮次返回时不能记到后续任务。
+    const session = agent.sessionId
+      ? await this.app.store.get<SessionRecord>('session', agent.sessionId)
+      : null;
+    const task = session?.activeTaskId
+      ? await this.app.store.get<WorkRecord>('task', session.activeTaskId)
+      : null;
+    const callContext: Context = {
+      ...ctx,
+      collaborationCall:
+        task?.collaboration?.agentId === agent.id
+          ? { taskId: task.id, intentId: task.collaboration.intentId }
+          : {},
+    };
+    const callId = id('bridge');
+    const record = async (outcome: 'started' | 'succeeded' | 'failed', messageId?: string) => {
+      if (!session) return;
+      await this.app.events.append(session, 'collaboration_bridge_call', {
+        callId,
+        tool: `${collaborationBridge.toolPrefix}${name}`,
+        outcome,
+        ...(messageId ? { messageId } : {}),
+      });
+    };
+    await record('started');
     await this.app.collaboration.storage.serial.run(member.teamId, async () => {
       const agent = await this.app.collaboration.agent(member.agentId);
       if (agent.bridge !== 'used') await this.app.collaboration.update(agent, { bridge: 'used' });
     });
-    return definition.run(ctx, args);
+    try {
+      const result = await definition.run(callContext, args);
+      const messageId = (result as { messageId?: string } | undefined)?.messageId;
+      await record('succeeded', messageId);
+      return result;
+    } catch (error) {
+      await record('failed');
+      throw error;
+    }
   }
 
   async connected(token: string) {
@@ -178,7 +213,18 @@ export class CollaborationIpc {
       if (agent.bridge === 'unconnected')
         await this.app.collaboration.update(agent, { bridge: 'connected' });
     });
-    return { connected: true };
+    const agent = await this.app.collaboration.agent(member.agentId);
+    return {
+      connected: true,
+      channel: collaborationBridge.serverName,
+      teamId: agent.teamId,
+      agentId: agent.id,
+      path: agent.path,
+      parentId: agent.parentId,
+      rootTarget: '/root',
+      configId: agent.configId,
+      configRevision: agent.configRevision,
+    };
   }
 
   async revoke(agentId: string) {

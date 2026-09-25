@@ -1,8 +1,8 @@
 import { realpath } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { bytes, id, now } from '../../domain/ids.js';
-import { fail } from '../../domain/errors.js';
+import { bytes, digest, id, now } from '../../domain/ids.js';
+import { AppError, fail } from '../../domain/errors.js';
 import type {
   Context,
   InteractionRecord,
@@ -19,6 +19,9 @@ import type {
   TeamRecord,
   TaskIntentRecord,
   RecoveryDecision,
+  CompletionCriteria,
+  AcceptanceResult,
+  MessageRecord,
 } from '../../domain/collaboration.js';
 import type { SqliteStore } from '../../infrastructure/storage/sqlite-store.js';
 import type { Row } from '../../infrastructure/storage/protocol.js';
@@ -52,6 +55,7 @@ export interface SpawnInput {
   teamId?: string | undefined;
   profile?: string | undefined;
   cwd?: string | undefined;
+  completionCriteria?: CompletionCriteria | undefined;
 }
 export interface TargetInput {
   requestId: string;
@@ -223,11 +227,18 @@ export class CollaborationController {
     else if (active && work && !terminalStates.has(work.state)) state = 'running';
     else state = 'idle';
     const stopReason = (work?.result as { stopReason?: string } | undefined)?.stopReason;
+    const completion = last
+      ? await this.app.store.get<MessageRecord>('collab_message', `msg_${last.id}`)
+      : null;
+    const acceptance = (completion?.body as { acceptance?: AcceptanceResult } | undefined)
+      ?.acceptance;
     return {
       agentId: agent.id,
       teamId: agent.teamId,
       path: agent.path,
       parentId: agent.parentId,
+      configId: agent.configId,
+      configRevision: agent.configRevision,
       state,
       queuedTasks: intents.filter((intent) => intent.state === 'queued').length,
       queuePaused: agent.queuePaused ?? false,
@@ -238,6 +249,7 @@ export class CollaborationController {
             ...(last.taskId ? { taskId: last.taskId } : {}),
             state: work?.state ?? last.state,
             ...(stopReason ? { stopReason } : {}),
+            ...(acceptance ? { acceptance } : {}),
           }
         : null,
       pending: pending.map(({ id, type, request, connectionGeneration }) => ({
@@ -265,13 +277,17 @@ export class CollaborationController {
 
   async spawn(ctx: Context, args: SpawnInput) {
     return this.storage.serial.run('spawn', async () => {
-      const previous = await this.app.store.replay<{ teamId: string; agentId: string }>(
-        this.storage.request(ctx, 'spawn_agent', args),
-      );
+      const previous = await this.app.store.replay<{
+        teamId: string;
+        agentId: string;
+        configId?: string;
+        configRevision?: number;
+      }>(this.storage.request(ctx, 'spawn_agent', args));
       if (previous) {
         await this.team(ctx, previous.teamId);
         return previous;
       }
+      this.checkTaskSize(args.message, args.completionCriteria);
       if (this.stopping) fail('INSTANCE_UNAVAILABLE', '实例正在停止。');
       if (ctx.collaborationMember && args.teamId && args.teamId !== ctx.collaborationMember.teamId)
         fail('ACCESS_DENIED', 'Bridge 不能切换团队。');
@@ -284,6 +300,13 @@ export class CollaborationController {
       const configs = availability.profiles
         .filter((p) => p.availability.ready)
         .map((p) => p.record);
+      if (!configs.length)
+        throw new AppError(
+          'AGENT_SETUP_REQUIRED',
+          '当前没有可用的 Agent profile。',
+          { phase: this.app.availability.phase(ctx, availability) },
+          '调用 discover_agents 查看原因并接入现有 Agent；只有用户明确指定目标后才能安装。',
+        );
       const matches = profile
         ? configs.filter((c) => c.id === profile || c.config.name === profile)
         : configs;
@@ -296,6 +319,7 @@ export class CollaborationController {
           },
         );
       let config = matches[0]!;
+      this.checkConfig(config.id, args.completionCriteria);
       if (parent) {
         if (config.id !== parent.configId)
           fail(
@@ -371,9 +395,17 @@ export class CollaborationController {
           agentId: agent.id,
           order: '1',
           message: args.message,
+          ...(args.completionCriteria ? { completionCriteria: args.completionCriteria } : {}),
           state: 'queued',
         };
-        const response = { teamId: team.id, agentId: agent.id, path, state: 'starting' };
+        const response = {
+          teamId: team.id,
+          agentId: agent.id,
+          path,
+          state: 'starting',
+          configId: agent.configId,
+          configRevision: agent.configRevision,
+        };
         await this.app.store.commit({
           maxLogicalBytes: this.app.settings.historyMaxBytes,
           checks: existing ? [] : [{ kind: 'collab_team', id: team.id, absent: true }],
@@ -391,13 +423,35 @@ export class CollaborationController {
     });
   }
 
-  async followup(ctx: Context, args: TargetInput & { message: string }) {
+  private checkConfig(configId: string, criteria?: CompletionCriteria) {
+    if (criteria?.configId !== undefined && criteria.configId !== configId)
+      fail('PROFILE_MISMATCH', '实际 profile 与验收要求的 configId 不一致，未创建任务。', {
+        expectedConfigId: criteria.configId,
+        actualConfigId: configId,
+      });
+  }
+
+  private checkTaskSize(message: string, criteria?: CompletionCriteria) {
+    const blocks = [
+      { type: 'text', text: message },
+      ...(criteria ? [{ type: 'text', text: JSON.stringify(criteria) }] : []),
+    ];
+    if (bytes(blocks) > 16 * 1024 ** 2 - 8192)
+      fail('CONFIG_INVALID', '任务正文与完成条件合计过大；序列化后必须小于 16 MiB 减 8 KiB。');
+  }
+
+  async followup(
+    ctx: Context,
+    args: TargetInput & { message: string; completionCriteria?: CompletionCriteria | undefined },
+  ) {
     const initial = await this.target(ctx, args.target, true);
     await this.renew(ctx, initial.team.id);
     return this.storage.serial.run(initial.team.id, async () => {
       const { agent, team } = await this.target(ctx, args.target, true);
       const replay = await this.app.store.replay(this.storage.request(ctx, 'followup_task', args));
       if (replay) return replay;
+      this.checkConfig(agent.configId, args.completionCriteria);
+      this.checkTaskSize(args.message, args.completionCriteria);
       await this.team(ctx, team.id, true);
       const view = await this.view(agent);
       if (['closed', 'closing', 'stopping', 'needs_recovery'].includes(view.state))
@@ -421,6 +475,7 @@ export class CollaborationController {
         agentId: agent.id,
         order: String(BigInt(intents.at(-1)?.order ?? '0') + 1n),
         message: args.message,
+        ...(args.completionCriteria ? { completionCriteria: args.completionCriteria } : {}),
         state: 'queued',
       };
       const response = { agentId: agent.id, intentId: intent.id, delivery: 'queued' };
@@ -445,7 +500,9 @@ export class CollaborationController {
     await this.renew(ctx, initial.team.id);
     return this.storage.serial.run(initial.team.id, async () => {
       const team = await this.team(ctx, initial.team.id, true);
-      const replay = await this.app.store.replay(this.storage.request(ctx, 'send_message', args));
+      const replay = await this.app.store.replay<{ messageId: string; delivery: string }>(
+        this.storage.request(ctx, 'send_message', args),
+      );
       if (replay) return replay;
       if (initial.agent && (await this.agent(initial.agent.id)).lifecycle === 'closed')
         fail('AGENT_CLOSED', '成员已关闭。');
@@ -457,9 +514,17 @@ export class CollaborationController {
       const sender = ctx.collaborationMember
         ? await this.agent(ctx.collaborationMember.agentId)
         : null;
+      const channel = sender ? ('agent_collaboration' as const) : ('external' as const);
       const messageId = id('msg');
       const body = await this.sessions.events.externalize(messageId, { text: args.message });
-      const response = { messageId, delivery: 'queued' };
+      const response = {
+        messageId,
+        delivery: 'queued',
+        channel,
+        type: 'MESSAGE',
+        teamId: team.id,
+        recipient: initial.agent?.id ?? 'root',
+      };
       await this.storage.append(
         team,
         [
@@ -472,6 +537,11 @@ export class CollaborationController {
             from: sender?.path ?? '/root',
             agentId: sender?.id ?? 'root',
             type: 'MESSAGE',
+            channel,
+            textDigest: digest(args.message),
+            ...(sender && ctx.collaborationCall?.taskId && ctx.collaborationCall.intentId
+              ? { taskId: ctx.collaborationCall.taskId, intentId: ctx.collaborationCall.intentId }
+              : {}),
             body,
           },
         ],
@@ -494,6 +564,8 @@ export class CollaborationController {
       teamId: view.teamId,
       path: view.path,
       parentId: view.parentId,
+      configId: view.configId,
+      configRevision: view.configRevision,
       state: view.state,
       queuedTasks: view.queuedTasks,
       bridge: view.bridge,

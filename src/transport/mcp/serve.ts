@@ -74,10 +74,6 @@ export async function startHttp(
       onerror: () => {},
     },
   );
-  const stopObserving =
-    (options.toolset ?? 'collaboration') === 'collaboration'
-      ? await app.availability.observe(() => handler.notify.toolsChanged())
-      : () => {};
   const nodeHandler = toNodeHandler(handler);
   // 监听通配地址不等于接受任意 Host；显式白名单用于限制非预期主机名访问。
   const allowedHosts = [
@@ -144,13 +140,11 @@ export async function startHttp(
     server.listen(options.port, options.host);
     await once(server, 'listening');
   } catch (error) {
-    stopObserving();
     await handler.close();
     throw error;
   }
   const previous = app.onShutdown;
   app.onShutdown = async () => {
-    stopObserving();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await handler.close();

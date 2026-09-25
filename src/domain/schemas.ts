@@ -28,11 +28,15 @@ export const policyRule = z.strictObject({
   roots: z.array(absolutePath),
   command: z.strictObject({ executable: text, args: z.array(z.string()) }).optional(),
 });
-export const permissionPolicy = z.strictObject({
-  rules: z.array(policyRule),
-  fallback: z.literal('ask'),
-  timeoutMs: z.number().int().positive().nullable(),
-});
+export const permissionPolicy = z
+  .strictObject({
+    rules: z.array(policyRule),
+    fallback: z.literal('ask'),
+    timeoutMs: z.number().int().positive().nullable(),
+  })
+  .describe(
+    '可整体省略以使用默认策略；显式提供时 rules、fallback、timeoutMs 均必填，每条规则的 id 也必填；timeoutMs 可为 null。',
+  );
 export const mcpServer = z.union([
   z.strictObject({
     type: z.literal('stdio'),

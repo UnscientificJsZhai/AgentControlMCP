@@ -46,12 +46,13 @@ async function connectBridge(sessionId: string, params: Record<string, unknown>)
   );
   const tools = await client.listTools();
   assert.equal(tools.tools.length, 8);
+  assert.ok(tools.tools.every((tool) => tool.name.startsWith('acm_')));
   bridges.set(sessionId, client);
   await audit({ bridgeConnected: sessionId, tools: tools.tools.map((t) => t.name) });
 }
 
 async function bridgeCall(client: Client, name: string, args: Record<string, unknown>) {
-  const response = await client.callTool({ name, arguments: args });
+  const response = await client.callTool({ name: `acm_${name}`, arguments: args });
   const envelope = response.structuredContent as { ok: boolean; data: Record<string, unknown> };
   assert.equal(envelope.ok, true, JSON.stringify(response));
   return envelope.data;
@@ -266,6 +267,25 @@ async function handle(message: RpcMessage) {
         .map((block) => string(block.text))
         .join('');
       const cwd = sessions.get(sessionId)?.cwd ?? process.cwd();
+      if (text.startsWith('bridge-message ')) {
+        const bridge = bridges.get(sessionId);
+        assert.ok(bridge);
+        const firstBlock = object((params.prompt as unknown[])[0]);
+        await bridgeCall(bridge, 'send_message', {
+          requestId: `message-${message.id}`,
+          target: '/root',
+          message: string(firstBlock.text).slice('bridge-message '.length),
+        });
+      }
+      if (text.startsWith('native-message '))
+        update(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'native-root',
+          title: 'Interact with subagent root',
+          kind: 'other',
+          status: 'completed',
+          _meta: { 'codex.subagent': { agentThreadId: sessionId } },
+        });
       if (text.startsWith('bridge-spawn-')) {
         const bridge = bridges.get(sessionId);
         assert.ok(bridge);

@@ -29,12 +29,23 @@ export function errorDetail(error: unknown) {
     };
   }
   if (error instanceof z.ZodError) {
+    const flatten = (
+      issues: z.core.$ZodIssue[],
+      prefix: PropertyKey[] = [],
+    ): { path: PropertyKey[]; message: string }[] =>
+      issues.flatMap((issue) => {
+        const path = [...prefix, ...issue.path];
+        return issue.code === 'invalid_union' && issue.errors.length
+          ? issue.errors.flatMap((branch) => flatten(branch, path))
+          : [{ path, message: issue.message }];
+      });
+    const issues = flatten(error.issues);
     return {
       code: 'CONFIG_INVALID',
       message: '输入不符合 Schema。',
-      details: { issues: error.issues.map(({ path, message }) => ({ path, message })) },
+      details: { issues },
       retryable: false,
-      nextAction: '根据字段错误修改输入。',
+      nextAction: '根据 details.issues 中的完整字段路径修正输入。',
     };
   }
   // 不将第三方异常原文直接返回；其中可能含命令环境或认证信息。
