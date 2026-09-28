@@ -9,6 +9,7 @@
   "include": [
     "test/unit/**/*.ts",
     "test/integration/**/*.ts",
-    "src/infrastructure/storage/worker.ts"
+    "src/infrastructure/storage/worker.ts",
+    "src/infrastructure/platform/supervisor.ts"
   ]
 }

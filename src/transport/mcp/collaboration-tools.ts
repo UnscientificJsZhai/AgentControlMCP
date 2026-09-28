@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Container } from '../../bootstrap/container.js';
 import { absolutePath, text } from '../../domain/schemas.js';
+import { collaborationGuidance } from '../../domain/collaboration.js';
 import type { ToolDefinition } from './tools.js';
 
 const request = { requestId: text.max(128) };
@@ -89,16 +90,13 @@ export const collaborationSchemas = {
   close_agent: z.strictObject(target),
 };
 export const collaborationDescriptions: Record<keyof typeof collaborationSchemas, string> = {
-  spawn_agent:
-    '创建独立成员并开始任务，返回 teamId/agentId/configId/configRevision。profile 使用成功注册的 configId；新增注册失败时不能改用旧配置冒充。message 必须自包含背景与交付要求；子成员看不到父历史。completionCriteria 可固定预期 configId 和本轮必须发送的 Bridge MESSAGE；检查 acceptance，completed 仅表示 ACP 轮次结束。省略 teamId 创建新团队；Bridge 自动绑定父成员。',
+  spawn_agent: `创建独立成员并开始任务，返回 teamId/agentId/intentId/configId/configRevision 和下一步等待指引。profile 使用成功注册的 configId；新增注册失败时不能改用旧配置冒充。message 必须自包含背景与交付要求；子成员看不到父历史。completionCriteria 可固定预期 configId 和本轮必须发送的 Bridge MESSAGE。省略 teamId 创建新团队；Bridge 自动绑定父成员。${collaborationGuidance(false)}`,
   list_agents:
     '读取团队、成员实际 configId/configRevision、Bridge 状态、待办及 profile。target + detail=output 读取结果、acceptance 与本轮 Bridge 调用证据，可用 intentId 选择旧轮次、messageId 选择消息、cursor 分页大输出。connected 只表示握手，used 不代表所需消息已发送；必须核对 MESSAGE 与验收条件。',
   send_message:
     '将普通消息保存到目标邮箱，不启动空闲成员；queued 仅表示已保存。运行中通过协作工具读取，或随下一轮任务提供。',
-  followup_task:
-    '给已有成员安排独立后续轮次，保留它自己的会话历史。忙碌时 FIFO 排队，不向当前轮重复注入。',
-  wait_agent:
-    '等待调用者邮箱并返回实际消息、状态与 nextCursor。外部调用必须给 teamId；Bridge 自动确定邮箱。FINAL_ANSWER 是框架完成通知，不能替代 MESSAGE；completed 仅表示 ACP 轮次结束，必须检查 acceptance 与 configId。旧游标可重复读取，超时或断连不取消任务。',
+  followup_task: `给已有成员安排独立后续轮次，保留它自己的会话历史。忙碌时 FIFO 排队，不向当前轮重复注入。返回 teamId 和下一步等待指引。${collaborationGuidance(false)}`,
+  wait_agent: `等待调用者邮箱和监督范围；返回消息、当前待办、任务摘要、reason 与 nextCursor。外部调用必须给 teamId；Bridge 自动确定邮箱。旧游标可重复读取，超时或断连不取消任务。${collaborationGuidance(false)}`,
   interrupt_agent:
     '请求停止当前轮次并取消尚未执行的队列；accepted 不代表已经停止。保留成员身份和普通邮箱。',
   respond_agent:

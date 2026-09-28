@@ -99,6 +99,17 @@ export class SqliteStore {
     return this.call<T[]>('list', { kind });
   }
 
+  /** 在 Worker 中按协作归属过滤，避免每轮等待解码其他团队的全部记录。 */
+  listMatching<T>(kind: string, field: 'teamId' | 'agentId' | 'runtimeId', values: string[]) {
+    if (!values.length) return Promise.resolve([] as T[]);
+    return this.call<T[]>('listMatching', { kind, field, values });
+  }
+
+  /** 本连接写入与其他 SQLite 连接提交的轻量变化标记。 */
+  changeStamp() {
+    return this.call<string>('changeStamp', {});
+  }
+
   claim(key: string) {
     return this.call<string | null>('claim', { key });
   }

@@ -16,7 +16,11 @@ import type {
   TaskIntentRecord,
   TeamRecord,
 } from '../../domain/collaboration.js';
-import { collaborationBridge, completionType } from '../../domain/collaboration.js';
+import {
+  collaborationBridge,
+  collaborationGuidance,
+  completionType,
+} from '../../domain/collaboration.js';
 import { row } from '../../infrastructure/storage/sqlite-store.js';
 import { completionRows } from './store.js';
 import { collectResult, verifyCompletion } from './results.js';
@@ -428,7 +432,7 @@ export class CollaborationScheduler {
         type: message.type,
         body: message.body,
       });
-    const metadata = `协作成员 ${agent.path}，agentId=${agent.id}，团队 ${team.id}，configId=${agent.configId}。这里是 AgentControlMCP 团队；/root 是外部上游调用者，不是本客户端原生协作系统的 root。团队协作必须使用 MCP 服务 ${collaborationBridge.serverName} 的 acm_* 工具，不能用同名原生工具或最终回答替代。向上游发消息示例：agent_collaboration.acm_send_message({"requestId":"${intent.id}:message","target":"/root","message":"所需消息"})。若工具暂不可见，应报告 Bridge 不可用，不能改走原生通道。新成员看不到父历史；acm_spawn_agent.message 必须自包含目标、背景、输入、约束和交付标准。acm_send_message 只入邮箱；acm_followup_task 启动后续轮次；acm_wait_agent 读取邮箱。协作消息不代表真人批准。`;
+    const metadata = `协作成员 ${agent.path}，agentId=${agent.id}，团队 ${team.id}，configId=${agent.configId}。这里是 AgentControlMCP 团队；/root 是外部上游调用者，不是本客户端原生协作系统的 root。团队协作必须使用 MCP 服务 ${collaborationBridge.serverName} 的 acm_* 工具，不能用同名原生工具或最终回答替代。向上游发消息示例：agent_collaboration.acm_send_message({"requestId":"${intent.id}:message","target":"/root","message":"所需消息"})。若工具暂不可见，应报告 Bridge 不可用，不能改走原生通道。新成员看不到父历史；acm_spawn_agent.message 必须自包含目标、背景、输入、约束和交付标准。acm_send_message 只入邮箱；acm_followup_task 启动后续轮次。${collaborationGuidance(true)}`;
     const prompt = [
       { type: 'text' as const, text: intent.message },
       ...(intent.order === '1' ? [{ type: 'text' as const, text: metadata }] : []),

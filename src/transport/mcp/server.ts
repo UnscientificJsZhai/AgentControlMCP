@@ -16,6 +16,7 @@ import { invoke, createTools } from './tools.js';
 import { createMcpTools, describeTool, toolAnnotations } from './catalog.js';
 import type { Toolset } from './catalog.js';
 import { collaborationSchemas } from './collaboration-tools.js';
+import { collaborationGuidance } from '../../domain/collaboration.js';
 
 // 重入状态按 Container 保存，支持现代 HTTP 下一次请求创建新 server 后继续同一交互。
 const presentations = new WeakMap<
@@ -45,8 +46,7 @@ export function createServer(
       },
       ...(toolset === 'collaboration'
         ? {
-            instructions:
-              'AgentControlMCP 已连接，接入与协作工具始终可用。首次使用先调用 discover_agents；空 profiles 表示尚未配置，不表示服务未连接。优先使用已接入的 Agent，让用户明确选择安装目标后才调用 setup_agent；ACP 适配器同样属于安装。注册成功后直接使用返回的 configId 调用 spawn_agent，无需刷新目录或重连。新增 profile 失败时必须保留失败结果，不能用旧 profile 冒充；核对成员 configId 与所需 Bridge MESSAGE，completed 仅表示 ACP 轮次结束。',
+            instructions: `AgentControlMCP 已连接，接入与协作工具始终可用。首次使用先调用 discover_agents；空 profiles 表示尚未配置，不表示服务未连接。优先使用已接入的 Agent，让用户明确选择安装目标后才调用 setup_agent；ACP 适配器同样属于安装。注册成功后直接使用返回的 configId 调用 spawn_agent，无需刷新目录或重连。新增 profile 失败时必须保留失败结果，不能用旧 profile 冒充；核对成员 configId 与所需 Bridge MESSAGE，completed 仅表示 ACP 轮次结束。${collaborationGuidance(false)}`,
           }
         : {}),
     },

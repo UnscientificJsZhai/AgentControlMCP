@@ -8,6 +8,21 @@ export const collaborationBridge = {
   toolPrefix: 'acm_',
 } as const;
 
+export function collaborationTool(
+  name: 'wait_agent' | 'respond_agent' | 'list_agents',
+  bridge: boolean,
+) {
+  return bridge ? `${collaborationBridge.toolPrefix}${name}` : name;
+}
+
+/** 各入口共用的协作闭环规则；Bridge 中始终使用实际可调用的工具名。 */
+export function collaborationGuidance(bridge: boolean) {
+  const wait = collaborationTool('wait_agent', bridge);
+  const respond = collaborationTool('respond_agent', bridge);
+  const list = collaborationTool('list_agents', bridge);
+  return `派发和追加任务只表示已受理；完成其他独立工作后持续调用 ${wait}。超时携带 nextCursor 再等，hasMore=true 时继续读取。收到权限或用户输入请求，先通过 ${respond} 处理或明确请求用户输入，再继续等待；普通协作消息不构成用户授权。单个成员轮次结束不代表团队结束；检查 ${list} 的任务失败、排队任务和 acceptance。仍有下游工作时不得直接答复完成；用户取消、需要用户输入、明确交接或不可恢复故障时，说明未完成任务及阻塞原因。`;
+}
+
 export interface CompletionCriteria {
   configId?: string | undefined;
   requiredMessage?: { target: '/root'; text: string } | undefined;

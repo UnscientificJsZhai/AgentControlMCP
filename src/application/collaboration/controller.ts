@@ -11,7 +11,11 @@ import type {
   WorkRecord,
 } from '../../domain/models.js';
 import { terminalStates } from '../../domain/models.js';
-import { collaborationSchemaVersion, inSubtree } from '../../domain/collaboration.js';
+import {
+  collaborationSchemaVersion,
+  collaborationTool,
+  inSubtree,
+} from '../../domain/collaboration.js';
 import type {
   AgentState,
   AgentView,
@@ -175,9 +179,7 @@ export class CollaborationController {
   }
 
   async members(teamId: string) {
-    return (await this.app.store.list<ManagedAgentRecord>('collab_agent')).filter(
-      (agent) => agent.teamId === teamId,
-    );
+    return this.app.store.listMatching<ManagedAgentRecord>('collab_agent', 'teamId', [teamId]);
   }
 
   async update(
@@ -212,9 +214,11 @@ export class CollaborationController {
       : null;
     const runtimeId = session?.runtimeId ?? agent.runtimeId;
     const pending = runtimeId
-      ? (await this.app.store.list<InteractionRecord>('interaction')).filter(
-          (i) => i.runtimeId === runtimeId && i.state === 'pending',
-        )
+      ? (
+          await this.app.store.listMatching<InteractionRecord>('interaction', 'runtimeId', [
+            runtimeId,
+          ])
+        ).filter((i) => i.state === 'pending')
       : [];
     let state: AgentState;
     if (
@@ -283,12 +287,17 @@ export class CollaborationController {
       const previous = await this.app.store.replay<{
         teamId: string;
         agentId: string;
+        intentId?: string;
         configId?: string;
         configRevision?: number;
       }>(this.storage.request(ctx, 'spawn_agent', args));
       if (previous) {
         await this.team(ctx, previous.teamId);
-        return previous;
+        return {
+          ...previous,
+          intentId: previous.intentId ?? (await this.storage.intents(previous.agentId))[0]?.id,
+          nextAction: this.waitAction(ctx, previous.teamId),
+        };
       }
       this.checkTaskSize(args.message, args.completionCriteria);
       if (this.stopping) fail('INSTANCE_UNAVAILABLE', '实例正在停止。');
@@ -404,10 +413,12 @@ export class CollaborationController {
         const response = {
           teamId: team.id,
           agentId: agent.id,
+          intentId: intent.id,
           path,
           state: 'starting',
           configId: agent.configId,
           configRevision: agent.configRevision,
+          nextAction: this.waitAction(ctx, team.id),
         };
         await this.app.store.commit({
           maxLogicalBytes: this.app.settings.historyMaxBytes,
@@ -451,8 +462,10 @@ export class CollaborationController {
     await this.renew(ctx, initial.team.id);
     return this.storage.serial.run(initial.team.id, async () => {
       const { agent, team } = await this.target(ctx, args.target, true);
-      const replay = await this.app.store.replay(this.storage.request(ctx, 'followup_task', args));
-      if (replay) return replay;
+      const replay = await this.app.store.replay<Record<string, unknown>>(
+        this.storage.request(ctx, 'followup_task', args),
+      );
+      if (replay) return { ...replay, teamId: team.id, nextAction: this.waitAction(ctx, team.id) };
       this.checkConfig(agent.configId, args.completionCriteria);
       this.checkTaskSize(args.message, args.completionCriteria);
       await this.team(ctx, team.id, true);
@@ -481,7 +494,13 @@ export class CollaborationController {
         ...(args.completionCriteria ? { completionCriteria: args.completionCriteria } : {}),
         state: 'queued',
       };
-      const response = { agentId: agent.id, intentId: intent.id, delivery: 'queued' };
+      const response = {
+        agentId: agent.id,
+        intentId: intent.id,
+        teamId: team.id,
+        delivery: 'queued',
+        nextAction: this.waitAction(ctx, team.id),
+      };
       await this.app.store.commit({
         maxLogicalBytes: this.app.settings.historyMaxBytes,
         puts: [
@@ -619,6 +638,243 @@ export class CollaborationController {
     };
   }
 
+  private waitAction(ctx: Context, teamId: string, cursor?: string) {
+    return {
+      tool: collaborationTool('wait_agent', Boolean(ctx.collaborationMember)),
+      teamId,
+      ...(cursor ? { cursor } : {}),
+      instruction: '完成其他独立工作后继续等待；超时使用 nextCursor，hasMore 时继续读取。',
+    };
+  }
+
+  /** 待办从交互当前状态重建，不能受邮箱游标或历史通知影响。 */
+  private async pendingInteractions(ctx: Context, team: TeamRecord, agents: ManagedAgentRecord[]) {
+    const parentId = ctx.collaborationMember?.agentId;
+    const visible = agents.filter((agent) => !parentId || agent.parentId === parentId);
+    const runtimes = await Promise.all(visible.map((agent) => this.runtimeFor(agent)));
+    const byRuntime = new Map(
+      visible.flatMap((agent, index) =>
+        runtimes[index] ? [[runtimes[index].id, { agent, runtime: runtimes[index] }] as const] : [],
+      ),
+    );
+    const pending = (
+      await this.app.store.listMatching<InteractionRecord>('interaction', 'runtimeId', [
+        ...byRuntime.keys(),
+      ])
+    ).filter((record) => {
+      const match = byRuntime.get(record.runtimeId);
+      return (
+        match &&
+        match.agent.lifecycle !== 'closed' &&
+        match.runtime.state !== 'closed' &&
+        record.state === 'pending' &&
+        record.instanceId === team.instanceId &&
+        record.connectionGeneration === match.runtime.connectionGeneration &&
+        (!record.expiresAt || Date.parse(record.expiresAt) > Date.now())
+      );
+    });
+    const parentRuntime = parentId ? await this.runtimeFor(await this.agent(parentId)) : null;
+    return Promise.all(
+      pending.map(async (record) => {
+        const { agent } = byRuntime.get(record.runtimeId)!;
+        const isPermission = record.type === 'permission' || record.type === 'host_permission';
+        const options = Array.isArray(record.request.options) ? record.request.options : [];
+        const delegatedOptions =
+          parentId && isPermission
+            ? await Promise.all(
+                options.map(async (option) => {
+                  const optionId = (option as { optionId?: unknown }).optionId;
+                  return typeof optionId === 'string' && parentRuntime
+                    ? (await this.app.interactions.mayDelegateApproval(parentRuntime.id, record, {
+                        kind: 'acp_option',
+                        optionId,
+                      }))
+                      ? optionId
+                      : null
+                    : null;
+                }),
+              )
+            : [];
+        const mayApproveHost =
+          record.type === 'host_permission' &&
+          (!parentId ||
+            (parentRuntime &&
+              (await this.app.interactions.mayDelegateApproval(parentRuntime.id, record, {
+                kind: 'host',
+                allow: true,
+              }))));
+        const canApprove =
+          !parentId ||
+          delegatedOptions.some(
+            (option, index) =>
+              option !== null &&
+              !(option && String((options[index] as { kind?: unknown }).kind).startsWith('reject')),
+          );
+        const tool = collaborationTool('respond_agent', Boolean(parentId));
+        const nextAction = isPermission
+          ? {
+              tool,
+              target: agent.id,
+              action: 'reply',
+              instruction:
+                record.type === 'host_permission'
+                  ? parentId
+                    ? mayApproveHost
+                      ? '审阅后可使用 decision={kind:"host",allow:true|false} 答复；提交时复核委托授权，冲突时刷新待办。'
+                      : '仅可使用 decision={kind:"host",allow:false} 拒绝；批准交给外部 root。冲突时刷新待办。'
+                    : '审阅后使用 decision={kind:"host",allow:true|false} 答复；冲突时刷新待办。'
+                  : parentId
+                    ? canApprove
+                      ? '先审阅请求，仅可按 delegableOptionIds 答复；其他批准交给外部 root。提交时会复核授权，冲突时刷新待办。'
+                      : '批准超出委托范围，请交给外部 root；仅可按 delegableOptionIds 拒绝或取消。冲突时刷新待办。'
+                    : '先审阅请求，再按原始选项答复；提交时会重新检查授权。已由其他控制者处理时刷新待办。',
+            }
+          : {
+              tool: collaborationTool('respond_agent', false),
+              target: agent.id,
+              action: record.type === 'terminal_auth' ? 'reply' : 'present',
+              instruction:
+                record.type === 'terminal_auth'
+                  ? '认证由外部 root 通过现有认证或 CLI 路径处理。'
+                  : '由外部 root 使用真实用户呈现流程处理；不得伪造审阅结果。',
+            };
+        return {
+          agentId: agent.id,
+          path: agent.path,
+          interactionId: record.id,
+          type: record.type,
+          request: record.request,
+          options,
+          expiresAt: record.expiresAt,
+          connectionGeneration: record.connectionGeneration,
+          ...(parentId && isPermission
+            ? {
+                delegableOptionIds: delegatedOptions.filter(
+                  (option): option is string => option !== null,
+                ),
+                ...(record.type === 'host_permission'
+                  ? { mayApproveHost: Boolean(mayApproveHost) }
+                  : {}),
+              }
+            : {}),
+          nextAction,
+        };
+      }),
+    );
+  }
+
+  private async supervision(ctx: Context, agents: ManagedAgentRecord[]) {
+    const caller = ctx.collaborationMember
+      ? agents.find((agent) => agent.id === ctx.collaborationMember!.agentId)
+      : null;
+    if (ctx.collaborationMember && !caller) fail('OBJECT_NOT_FOUND', '协作成员不存在。');
+    const scoped = caller ? agents.filter((agent) => inSubtree(caller.path, agent.path)) : agents;
+    const ids = new Set(scoped.map((agent) => agent.id));
+    const intents = agents.length
+      ? (
+          await this.app.store.listMatching<TaskIntentRecord>('collab_intent', 'teamId', [
+            agents[0]!.teamId,
+          ])
+        ).filter((intent) => ids.has(intent.agentId))
+      : [];
+    const tasks = await Promise.all(
+      intents.map(async (intent) =>
+        intent.state !== 'settled' && intent.taskId
+          ? await this.app.store.get<WorkRecord>('task', intent.taskId)
+          : null,
+      ),
+    );
+    const unfinishedTasks = intents.flatMap((intent, index) =>
+      intent.state !== 'settled' || (tasks[index] && !terminalStates.has(tasks[index].state))
+        ? [
+            {
+              agentId: intent.agentId,
+              intentId: intent.id,
+              state: intent.state,
+              ...(intent.taskId ? { taskId: intent.taskId } : {}),
+              ...(tasks[index] ? { taskState: tasks[index].state } : {}),
+            },
+          ]
+        : [],
+    );
+    const queuedTasks = unfinishedTasks.filter((intent) => intent.state === 'queued');
+    const blockedAgents = (
+      await Promise.all(
+        scoped.map(async (agent) => {
+          const session = agent.sessionId
+            ? await this.app.store.get<SessionRecord>('session', agent.sessionId)
+            : null;
+          const hasQueued = queuedTasks.some((intent) => intent.agentId === agent.id);
+          const waitingInteraction = intents.some(
+            (intent, index) =>
+              intent.agentId === agent.id && tasks[index]?.state === 'waiting_interaction',
+          );
+          const cause = agent.authRequired
+            ? 'authentication'
+            : waitingInteraction &&
+                ctx.collaborationMember &&
+                agent.parentId !== ctx.collaborationMember.agentId
+              ? 'input_with_root'
+              : agent.lifecycle === 'paused' ||
+                  (hasQueued &&
+                    agent.lifecycle === 'active' &&
+                    agent.sessionId &&
+                    session?.state !== 'ready')
+                ? 'needs_recovery'
+                : agent.queuePaused && hasQueued
+                  ? 'queue_paused'
+                  : null;
+          return cause ? { agentId: agent.id, path: agent.path, cause } : null;
+        }),
+      )
+    ).filter((agent): agent is NonNullable<typeof agent> => agent !== null);
+    const changingAgents = scoped
+      .filter(
+        (agent) =>
+          ['starting', 'stopping', 'closing'].includes(agent.lifecycle) ||
+          Boolean(agent.operationId),
+      )
+      .map((agent) => ({ agentId: agent.id, path: agent.path, lifecycle: agent.lifecycle }));
+    return {
+      unfinishedTasks,
+      queuedTasks,
+      blockedAgents,
+      changingAgents,
+      settledIntents: intents.filter((intent) => intent.state === 'settled'),
+    };
+  }
+
+  private async outcomes(intents: TaskIntentRecord[]) {
+    const outcomes = await Promise.all(
+      intents.map(async (intent) => {
+        const completion = await this.app.store.get<{ work: WorkRecord }>(
+          'collab_outbox',
+          intent.id,
+        );
+        const message = await this.app.store.get<MessageRecord>(
+          'collab_message',
+          `msg_${intent.id}`,
+        );
+        const acceptance = (message?.body as { acceptance?: AcceptanceResult } | undefined)
+          ?.acceptance;
+        return {
+          agentId: intent.agentId,
+          intentId: intent.id,
+          state: completion?.work.state ?? 'settled',
+          ...(acceptance ? { acceptance } : {}),
+        };
+      }),
+    );
+    return {
+      failedTasks: outcomes.filter(
+        (outcome) => outcome.state !== 'completed' || outcome.acceptance?.status === 'failed',
+      ),
+      completedTasks: outcomes.filter(
+        (outcome) => outcome.state === 'completed' && outcome.acceptance?.status !== 'failed',
+      ).length,
+    };
+  }
+
   async wait(
     ctx: Context,
     args: {
@@ -636,11 +892,73 @@ export class CollaborationController {
     await this.team(ctx, teamId);
     if (args.cursor) await this.storage.acknowledge(teamId, recipient, args.cursor);
     const deadline = Date.now() + (args.timeoutMs ?? 10_000);
+    let observedStamp: string | undefined;
+    let snapshot:
+      | {
+          agents: ManagedAgentRecord[];
+          pendingInteractions: Awaited<ReturnType<CollaborationController['pendingInteractions']>>;
+          supervision: Awaited<ReturnType<CollaborationController['supervision']>>;
+        }
+      | undefined;
     for (;;) {
-      await this.team(ctx, teamId);
+      const stamp = await this.app.store.changeStamp();
+      if (!snapshot || observedStamp !== stamp) {
+        const team = await this.team(ctx, teamId);
+        const agents = await this.members(teamId);
+        const [pendingInteractions, supervision] = await Promise.all([
+          this.pendingInteractions(ctx, team, agents),
+          this.supervision(ctx, agents),
+        ]);
+        observedStamp = stamp;
+        snapshot = { agents, pendingInteractions, supervision };
+        // 状态计算期间如有并发写入，下轮重建快照，不混合新旧状态。
+        if ((await this.app.store.changeStamp()) !== stamp) continue;
+      }
       const page = await this.storage.mailbox(teamId, recipient, args.cursor);
-      if (page.messages.length || Date.now() >= deadline || ctx.signal?.aborted) {
+      const { agents, pendingInteractions, supervision } = snapshot;
+      const reason = ctx.signal?.aborted
+        ? 'aborted'
+        : pendingInteractions.length
+          ? 'input_required'
+          : supervision.blockedAgents.length
+            ? 'blocked'
+            : page.messages.length
+              ? 'message'
+              : !supervision.unfinishedTasks.length && !supervision.changingAgents.length
+                ? 'settled'
+                : Date.now() >= deadline
+                  ? 'timeout'
+                  : null;
+      if (reason) {
         await this.team(ctx, teamId);
+        if ((await this.app.store.changeStamp()) !== observedStamp && !ctx.signal?.aborted) {
+          snapshot = undefined;
+          continue;
+        }
+        const results = await this.outcomes(supervision.settledIntents);
+        const views = await Promise.all(agents.map((agent) => this.visibleView(ctx, agent)));
+        if ((await this.app.store.changeStamp()) !== observedStamp && !ctx.signal?.aborted) {
+          snapshot = undefined;
+          continue;
+        }
+        const nextAction =
+          reason === 'input_required'
+            ? {
+                instruction:
+                  '先处理或升级 pendingInteractions，再继续等待；不要反复立即调用等待工具。',
+                interactions: pendingInteractions.map((item) => item.interactionId),
+              }
+            : reason === 'blocked'
+              ? {
+                  tool: collaborationTool('list_agents', Boolean(ctx.collaborationMember)),
+                  instruction: `先检查 blockedAgents 的 cause、失败结果和队列；恢复故障使用 ${collaborationTool('respond_agent', Boolean(ctx.collaborationMember))} prepare_restore，审批超出委托范围交给外部 root。无法继续时说明阻塞原因。`,
+                }
+              : reason === 'settled'
+                ? {
+                    tool: collaborationTool('list_agents', Boolean(ctx.collaborationMember)),
+                    instruction: '检查失败任务、结果与 acceptance 后汇总。',
+                  }
+                : this.waitAction(ctx, teamId, page.nextCursor);
         return {
           messages: page.messages.map(({ id, body, ...m }) => ({
             ...m,
@@ -649,10 +967,18 @@ export class CollaborationController {
           })),
           nextCursor: page.nextCursor,
           hasMore: page.hasMore,
-          agents: await Promise.all(
-            (await this.members(teamId)).map((a) => this.visibleView(ctx, a)),
-          ),
-          timedOut: !page.messages.length && Date.now() >= deadline,
+          agents: views,
+          reason,
+          pendingInteractions,
+          supervision: {
+            unfinishedTasks: supervision.unfinishedTasks,
+            queuedTasks: supervision.queuedTasks,
+            blockedAgents: supervision.blockedAgents,
+            changingAgents: supervision.changingAgents,
+            ...results,
+          },
+          nextAction,
+          timedOut: reason === 'timeout',
         };
       }
       await delay(Math.min(50, Math.max(1, deadline - Date.now())));

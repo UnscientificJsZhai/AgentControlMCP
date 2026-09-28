@@ -329,6 +329,31 @@ parentPort?.on('message', (request: RpcRequest) => {
           .all(args.kind as string)
           .map(decode);
         break;
+      case 'listMatching': {
+        const field = args.field;
+        const values = args.values;
+        if (
+          !['teamId', 'agentId', 'runtimeId'].includes(String(field)) ||
+          !Array.isArray(values) ||
+          values.length > 1024 ||
+          values.some((value) => typeof value !== 'string')
+        )
+          fail('CONFIG_INVALID', '存储过滤条件无效。');
+        const matches = values as string[];
+        response.value = db
+          .prepare(
+            `SELECT data FROM records WHERE kind=? AND json_extract(data, ?) IN (${matches.map(() => '?').join(',')}) ORDER BY id`,
+          )
+          .all(args.kind as string, `$.${field as string}`, ...matches)
+          .map(decode);
+        break;
+      }
+      case 'changeStamp': {
+        const external = db.prepare('PRAGMA data_version').get()?.data_version;
+        const local = db.prepare('SELECT total_changes() AS changes').get()?.changes;
+        response.value = `${String(external)}:${String(local)}`;
+        break;
+      }
       case 'claim':
         response.value =
           db.prepare('SELECT holder FROM claims WHERE key=?').get(args.key as string)?.holder ??

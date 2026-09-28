@@ -62,9 +62,9 @@ export class CollaborationStore {
   }
 
   async intents(agentId: string) {
-    return (await this.db.list<TaskIntentRecord>('collab_intent'))
-      .filter((item) => item.agentId === agentId)
-      .sort((a, b) => (BigInt(a.order) < BigInt(b.order) ? -1 : 1));
+    return (
+      await this.db.listMatching<TaskIntentRecord>('collab_intent', 'agentId', [agentId])
+    ).sort((a, b) => (BigInt(a.order) < BigInt(b.order) ? -1 : 1));
   }
 
   /** 调用者持有团队串行锁，序号与消息、去重标志一同提交。 */
