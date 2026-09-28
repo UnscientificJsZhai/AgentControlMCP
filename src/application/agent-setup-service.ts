@@ -36,6 +36,11 @@ export class AgentSetupService {
     },
   ) {
     const snapshot = await this.availability.snapshot();
+    const registry = await this.installations.registry.search(
+      args.sourceId,
+      args.query,
+      platformKey(),
+    );
     return {
       phase: this.availability.phase(ctx, snapshot),
       profiles: snapshot.profiles.map(({ record, availability }) => ({
@@ -54,13 +59,11 @@ export class AgentSetupService {
         state: item.state,
       })),
       sources: await this.installations.registry.sources(),
-      candidates: paginate(
-        await this.installations.registry.search(args.sourceId, args.query, platformKey()),
-        args,
-      ),
+      candidates: paginate(registry.items, args),
+      refreshErrors: registry.refreshErrors,
       ...(args.local ? { local: await this.local.scan(args.local.paths) } : {}),
       guidance:
-        'AgentControlMCP 已连接，工具目录固定。空 profiles 表示尚未配置。优先接入现有 Agent；只有用户明确指定安装目标（含 ACP 适配器）才调用 setup_agent 的 install/apply_local。setup_agent 参数为 {action, arguments: {...}}，可省略整个 permissionPolicy 使用默认策略。注册成功后直接将 configId 传给 spawn_agent.profile；新增失败不能用旧配置冒充。无 Registry 缓存时可显式 refresh_registry。',
+        'AgentControlMCP 已连接，工具目录固定。空 profiles 表示尚未配置。优先接入现有 Agent；只有用户明确指定安装目标（含 ACP 适配器）才调用 setup_agent 的 install/apply_local。setup_agent 参数为 {action, arguments: {...}}，可省略整个 permissionPolicy 使用默认策略。注册成功后直接将 configId 传给 spawn_agent.profile；新增失败不能用旧配置冒充。无 Registry 缓存时会自动刷新；刷新失败见 refreshErrors，也可显式 refresh_registry。',
     };
   }
 

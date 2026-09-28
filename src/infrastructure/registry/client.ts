@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { digest, id, now } from '../../domain/ids.js';
-import { AppError, fail } from '../../domain/errors.js';
+import { AppError, errorDetail, fail } from '../../domain/errors.js';
+import type { ErrorDetail } from '../../domain/errors.js';
 import type {
   Context,
   RegistryAgent,
@@ -151,6 +152,8 @@ export class RegistryClient {
       delete source.snapshotId;
       delete source.etag;
       delete source.fetchedAt;
+      delete source.error;
+      delete source.refreshError;
     }
     const result = await this.store.commit({
       checks: previous
@@ -211,6 +214,7 @@ export class RegistryClient {
         fetchedAt: now(),
       };
       delete next.error;
+      delete next.refreshError;
       const etag = fetched.response.headers.get('etag');
       if (etag) next.etag = etag;
       await this.store.commit({
@@ -227,6 +231,7 @@ export class RegistryClient {
               ...source,
               revision: source.revision + 1,
               error: '刷新失败；保留原缓存与固定版本。',
+              refreshError: errorDetail(error),
             }),
           ],
         });
@@ -248,15 +253,71 @@ export class RegistryClient {
             'registry_snapshot',
             snapshotId ?? source.snapshotId!,
           )
-        : await this.store.locked(`registry-initialize:${sourceId}`, () => this.refresh(sourceId));
+        : await this.initializeSnapshot(sourceId);
     if (!snapshot || snapshot.sourceId !== sourceId) fail('OBJECT_NOT_FOUND', '来源快照不存在。');
     const agent = snapshot.agents.find((agent) => agent.id === registryAgentId);
     if (!agent) fail('OBJECT_NOT_FOUND', '来源没有此 Agent。');
     return { sourceId, snapshotId: snapshot.id, cachedAt: snapshot.createdAt, agent };
   }
 
-  /** 搜索仅遍历启用来源的已有快照，不在每次搜索时隐式发起网络刷新。 */
+  /** 仅在来源没有快照时刷新；锁内复查使并发首次读取共用一次下载。 */
+  private initializeSnapshot(sourceId: string, enabledOnly = false, observedRevision?: number) {
+    return this.store.locked(
+      `registry-initialize:${sourceId}`,
+      async () => {
+        const source = await this.store.get<RegistrySource>('source', sourceId);
+        if (!source) fail('OBJECT_NOT_FOUND', 'Registry 来源不存在。');
+        if (enabledOnly && !source.enabled) return null;
+        if (source.snapshotId)
+          return this.store.get<RegistrySnapshot>('registry_snapshot', source.snapshotId);
+        // 已排队的查询共用前一次失败；失败后的新查询仍可立即重试。
+        if (
+          observedRevision !== undefined &&
+          source.revision !== observedRevision &&
+          source.error
+        ) {
+          const detail = source.refreshError;
+          if (detail)
+            throw new AppError(
+              detail.code,
+              detail.message,
+              detail.details ?? {},
+              detail.nextAction,
+            );
+          throw new AppError('REGISTRY_UNAVAILABLE', source.error);
+        }
+        return this.refresh(sourceId);
+      },
+      90_000,
+    );
+  }
+
+  /** 首次搜索填充启用来源的空缓存；各来源的刷新失败随结果返回。 */
   async search(sourceId?: string, query = '', platform?: string) {
+    const coldSources = (await this.sources()).filter(
+      (source) => (!sourceId || source.id === sourceId) && source.enabled && !source.snapshotId,
+    );
+    const refreshErrors = (
+      await Promise.all(
+        coldSources.map(
+          async (source): Promise<{ sourceId: string; error: ErrorDetail } | null> => {
+            try {
+              await this.initializeSnapshot(source.id, true, source.revision);
+              return null;
+            } catch (error) {
+              return {
+                sourceId: source.id,
+                error: {
+                  ...errorDetail(error),
+                  retryable: true,
+                  nextAction: '下一次查询会自动重试；也可显式刷新 Registry 来源。',
+                },
+              };
+            }
+          },
+        ),
+      )
+    ).filter((error) => error !== null);
     const items = [];
     for (const source of await this.sources()) {
       if ((sourceId && source.id !== sourceId) || !source.enabled || !source.snapshotId) continue;
@@ -282,6 +343,6 @@ export class RegistryClient {
             snapshotId: snapshot!.id,
           });
     }
-    return items;
+    return { items, refreshErrors };
   }
 }

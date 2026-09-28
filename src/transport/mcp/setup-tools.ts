@@ -61,9 +61,9 @@ export function createSetupTools(app: Container): ToolDefinition[] {
       schema: discoverSchema,
       readOnly: true,
       destructive: false,
-      openWorld: false,
+      openWorld: true,
       description:
-        '发现可用 profile、现有安装及缓存中的 Registry 候选并返回接入指引；local 参数才扫描本地 Codex。不安装、不注册、不启动 ACP。无可用 Agent 时请让用户明确选择安装目标，优先复用现有安装。',
+        '发现可用 profile、现有安装及 Registry 候选；无快照时自动刷新，失败来源列于 refreshErrors。local 参数才扫描本地 Codex。不安装、不注册、不启动 ACP。无可用 Agent 时请让用户明确选择安装目标，优先复用现有安装。',
       run: (ctx, input) => app.setup.discover(ctx, discoverSchema.parse(input)),
     },
     {

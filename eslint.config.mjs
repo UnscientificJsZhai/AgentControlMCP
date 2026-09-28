@@ -79,7 +79,7 @@ export default defineConfig([
     },
   },
   {
-    files: ['test/**/*.ts'],
+    files: ['test/unit/**/*.ts'],
     rules: {
       'no-restricted-imports': [
         'error',

@@ -194,6 +194,7 @@ export interface RegistrySource extends Entity {
   fetchedAt?: string;
   etag?: string;
   error?: string;
+  refreshError?: ErrorDetail;
 }
 
 export interface Distribution {

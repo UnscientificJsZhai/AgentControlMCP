@@ -202,7 +202,7 @@ export function createTools(app: Container): ToolDefinition[] {
     },
     true,
   );
-  // 来源查询与刷新分开：搜索使用缓存，显式刷新产生可跟踪的后台操作。
+  // 首次搜索填充空缓存；显式刷新仍产生可跟踪的后台操作。
   add(
     'registry_list_sources',
     '列出 Registry 来源与缓存状态。',
@@ -244,15 +244,17 @@ export function createTools(app: Container): ToolDefinition[] {
   );
   add(
     'registry_search',
-    '在缓存中查找 Agent，并呈现明确来源、版本、分发与许可证。',
+    '在 Registry 中查找 Agent；无快照时自动刷新，失败来源列于 refreshErrors。',
     obj({
       sourceId: text.optional(),
       query: z.string().optional(),
       platform: text.optional(),
       ...page,
     }),
-    async (_ctx, args) =>
-      paginate(await app.registry.search(args.sourceId, args.query, args.platform), args),
+    async (_ctx, args) => {
+      const result = await app.registry.search(args.sourceId, args.query, args.platform);
+      return { ...paginate(result.items, args), refreshErrors: result.refreshErrors };
+    },
     true,
   );
   add(

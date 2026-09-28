@@ -126,12 +126,12 @@ export class SqliteStore {
   }
 
   /**
-   * 通过持久化 claim 协调数据库事务以外的文件操作，最多等待三十秒取得锁。
+   * 通过持久化 claim 协调数据库事务以外的文件操作，默认最多等待三十秒取得锁。
    * 仅 ESRCH 能证明原持有进程不存在；权限不足等探测失败不能作为抢占依据。
    */
-  async locked<T>(key: string, action: () => Promise<T>): Promise<T> {
+  async locked<T>(key: string, action: () => Promise<T>, waitMs = 30_000): Promise<T> {
     const holder = `${process.pid}:${id('lock')}`;
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + waitMs;
     for (;;) {
       try {
         await this.commit({ claims: [{ key, holder }] });

@@ -6,5 +6,9 @@
     "outDir": ".test-dist",
     "sourceMap": true
   },
-  "include": ["test/unit/**/*.ts", "test/integration/**/*.ts"]
+  "include": [
+    "test/unit/**/*.ts",
+    "test/integration/**/*.ts",
+    "src/infrastructure/storage/worker.ts"
+  ]
 }
