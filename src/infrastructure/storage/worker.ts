@@ -7,12 +7,12 @@ import { now } from '../../domain/ids.js';
 // 同步数据库只在 Worker 内运行；WAL 支持多实例读取，FULL 同步用于持久化已受理的操作。
 const { path } = workerData as { path: string };
 const db = new DatabaseSync(path);
+// 首次 WAL 切换也会取得写锁，必须先配置等待，再执行任何建库或迁移操作。
+db.exec('PRAGMA busy_timeout=5000;');
 const version = db.prepare('PRAGMA user_version').get()?.user_version;
 const incompatible = version !== 0 && version !== 2;
 if (!incompatible) {
-  db.exec(
-    'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;',
-  );
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;');
 
   db.exec(`BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id));

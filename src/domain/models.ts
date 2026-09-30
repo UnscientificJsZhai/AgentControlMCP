@@ -10,6 +10,11 @@ export interface Context {
   /** 当前请求的等待生命周期；后台任务是否取消由相应应用服务决定。 */
   signal?: AbortSignal;
   nativeInteraction?: boolean;
+  /** 仅本次连接有效，不写入团队等持久化对象。 */
+  connectionId?: string;
+  /** 已受理 HTTP 工作的一次性内存准入凭证，不表示仍有双向连接。 */
+  interactionAdmissionId?: string;
+  startupCwd?: string;
   /** 仅专用 Bridge 验证后建立的调用身份，绝不从工具参数接收。 */
   collaborationMember?: { teamId: string; agentId: string };
   /** Bridge 收到调用时固定的任务归属；排队或长调用结束后不能归入下一轮。 */
@@ -144,6 +149,10 @@ export interface InteractionRecord extends Entity {
 /** 宿主服务实例及其本地管理地址；nonce 用于管理连接握手，不能当作公开元数据。 */
 export interface InstanceRecord extends Entity {
   mode: Context['mode'];
+  role?: 'execution_service';
+  launchSource?: 'auto_stdio' | 'manual_http';
+  lifecyclePolicy?: 'idle' | 'persistent';
+  phase?: 'starting' | 'ready' | 'draining' | 'stopped';
   serviceId: string;
   pid: number;
   state: 'active' | 'stopped';

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { Socket } from 'node:net';
-import { fileURLToPath } from 'node:url';
+import { windowsNativeBinary } from './service-launcher.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
 // 此进程仅由 ProcessHost 启动。控制管道 EOF 也覆盖连接器被 SIGKILL 的场景。
@@ -41,11 +41,7 @@ control.on('data', (chunk) => {
     env: NodeJS.ProcessEnv;
   };
   const command =
-    process.platform === 'win32'
-      ? fileURLToPath(
-          new URL(`../../../native/win32-${process.arch}/process-host.exe`, import.meta.url),
-        )
-      : config.executable;
+    process.platform === 'win32' ? windowsNativeBinary('process-host') : config.executable;
   const args =
     process.platform === 'win32'
       ? ['--parent', String(process.pid), config.executable, ...config.args]

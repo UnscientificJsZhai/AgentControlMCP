@@ -7,20 +7,26 @@ const arch = process.argv[2] ?? process.arch;
 if (!['x64', 'arm64'].includes(arch)) throw new Error('进程宿主只支持 x64 和 arm64');
 const dir = `native/win32-${arch}`;
 await mkdir(dir, { recursive: true });
-const result = spawnSync(
-  'cl.exe',
-  [
-    '/nologo',
-    '/W4',
-    '/WX',
-    '/O2',
-    '/MT',
-    '/utf-8',
-    'native/windows/process-host.c',
-    `/Fo${dir}/process-host.obj`,
-    `/Fe${dir}/process-host.exe`,
-  ],
-  { stdio: 'inherit', shell: false },
-);
-if (result.error) throw result.error;
-process.exitCode = result.status ?? 1;
+for (const name of ['process-host', 'service-launcher']) {
+  const result = spawnSync(
+    'cl.exe',
+    [
+      '/nologo',
+      '/W4',
+      '/WX',
+      '/O2',
+      '/MT',
+      '/utf-8',
+      `native/windows/${name}.c`,
+      `/Fo${dir}/${name}.obj`,
+      `/Fe${dir}/${name}.exe`,
+      ...(name === 'service-launcher' ? ['advapi32.lib'] : []),
+    ],
+    { stdio: 'inherit', shell: false },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    process.exitCode = result.status ?? 1;
+    break;
+  }
+}

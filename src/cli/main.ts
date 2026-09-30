@@ -6,9 +6,19 @@ import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { Container } from '../bootstrap/container.js';
-import { startHttp, startStdio, validateHttpOptions } from '../transport/mcp/serve.js';
+import { validateHttpOptions } from '../transport/mcp/serve.js';
+import { ExecutionService } from '../bootstrap/execution-service.js';
+import {
+  canonicalServicePaths,
+  findExecutionService,
+  ensureExecutionService,
+  connectExecutionService,
+  descriptorInstance,
+  serviceCredentials,
+} from '../infrastructure/service/discovery.js';
+import { proxyStdio } from '../transport/mcp/stdio-proxy.js';
 import { adminCommand } from '../transport/admin/commands.js';
-import { adminRequest, startAdmin } from '../transport/admin/ipc.js';
+import { adminRequest } from '../transport/admin/ipc.js';
 import { SqliteStore } from '../infrastructure/storage/sqlite-store.js';
 import { resolveEnvironment } from '../infrastructure/platform/environment.js';
 import { which } from '../infrastructure/platform/process-host.js';
@@ -21,7 +31,7 @@ import { createMcpTools, describeTool, toolsetSchema } from '../transport/mcp/ca
 import { startBridge } from '../transport/collaboration/bridge.js';
 import { createCollaborationTools } from '../transport/mcp/collaboration-tools.js';
 
-const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识> [--toolset collaboration|legacy|management]\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content / storage <子命令>\nstorage usage\nstorage cleanup [--scope orphans|cache]（默认只预览）\nstorage cleanup --mode apply --cleanup-plan-id <ID> --plan-digest <摘要>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出全部 CLI 操作及参数 Schema）\ntools --mcp [--toolset collaboration|legacy|management]（默认固定输出 3 个接入和 8 个协作工具；创建成员时检查 profile 是否可用）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
+const help = `agent-control-mcp 1.0.0 — 管理宿主机 ACP Agent\n\nserve stdio --client-id <稳定标识> [--toolset collaboration|legacy|management]（自动启动/连接统一服务，退出只断开代理）\nserve http --host 127.0.0.1 --port 7331 --auth token|none\nservice instances|status|stop [--instance <id>]\nidentity create --name <名称> | list | rotate --principal <id> | revoke --credential <id>\nconfig validate|apply --file <文档> | edit|export --id <配置> | migrate\nagent / registry / runtime / installation / session / task / operation / permission / interaction / history / content / storage <子命令>\nstorage usage\nstorage cleanup [--scope orphans|cache]（默认只预览）\nstorage cleanup --mode apply --cleanup-plan-id <ID> --plan-digest <摘要>\nlocal scan codex | plan --file <参数> | apply --file <已确认方案>\ninteraction attach --instance <id> （宿主交互终端）\ncall <完整工具名> --input '<JSON>' 或 --file <JSON 文件>\ntools （输出全部 CLI 操作及参数 Schema）\ntools --mcp [--toolset collaboration|legacy|management]（默认固定输出 3 个接入和 8 个协作工具；创建成员时检查 profile 是否可用）\n\n全局选项：--data-dir <目录> --instance <id> --json --no-wait\n复杂输入使用 --file；写操作自动生成幂等键，也可显式传 --idempotency-key。\n运行态命令须连接存活实例；身份/配置/安装命令也可离线运行。\n`;
 const flags = new Set(['json', 'help', 'no-wait', 'interactive', 'yes', 'mcp']);
 
 /** 将位置参数与选项分开；复杂结构交给 --file/--input 的 JSON 和具体工具 Schema 校验。 */
@@ -98,32 +108,65 @@ export async function main(argv = process.argv.slice(2)) {
           JSON.parse(await readFile(String(options.settings), 'utf8')) as unknown,
         )
       : undefined;
-    const app = await Container.create({ dataDir, mode: sub, ...(settings ? { settings } : {}) });
+    const servicePaths = await canonicalServicePaths(dataDir);
+    if (sub === 'stdio') {
+      const clientId = String(options['client-id'] ?? 'default');
+      if (!/^[\w.-]{1,128}$/.test(clientId)) fail('CONFIG_INVALID', 'stdio 需要稳定客户端标识。');
+      await proxyStdio(
+        await connectExecutionService(servicePaths, clientId, toolset, process.cwd(), settings),
+      );
+      return;
+    }
+    let existing = await findExecutionService(servicePaths, settings);
+    if (!existing) {
+      try {
+        const httpSettings = settings ?? (await savedHttpSettings(servicePaths.databasePath));
+        const service = await ExecutionService.start({
+          paths: servicePaths,
+          source: 'manual_http',
+          ...(settings ? { settings } : {}),
+          http: {
+            toolset,
+            host: String(options.host ?? httpSettings.httpHost),
+            port: Number(options.port ?? httpSettings.httpPort),
+            noAuth: (options.auth ?? httpSettings.httpAuth) === 'none',
+          },
+        });
+        const status = service.status();
+        process.stderr.write(
+          JSON.stringify({ listening: status.http, instanceId: service.app.instanceId }) + '\n',
+        );
+        return;
+      } catch (error) {
+        if (!(error instanceof AppError && error.code === 'RESOURCE_CONFLICT')) throw error;
+        existing = (await ensureExecutionService(servicePaths, settings)).descriptor;
+      }
+    }
+    const credentials = await serviceCredentials(existing);
+    const target = descriptorInstance(existing, credentials.nonce);
+    const serviceSettings = settingsSchema.parse(existing.settings);
+    const http = {
+      toolset,
+      host: String(options.host ?? serviceSettings.httpHost),
+      port: Number(options.port ?? serviceSettings.httpPort),
+      noAuth: (options.auth ?? serviceSettings.httpAuth) === 'none',
+    };
+    const status = unwrap((await adminRequest(target, '_ensure_http', http)).data);
+    process.stderr.write(
+      JSON.stringify({ listening: status, instanceId: target.id, reused: true }) + '\n',
+    );
+    const watch = await adminRequest(target, '_service_watch', {});
     const stop = () => {
-      void app.close().catch(() => {
-        process.exitCode = 1;
-      });
+      void adminRequest(target, '_stop', {}).catch(() => {});
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     try {
-      await startAdmin(app);
-      if (sub === 'stdio') startStdio(app, String(options['client-id'] ?? 'default'), toolset);
-      else {
-        const http = {
-          toolset,
-          host: String(options.host ?? app.settings.httpHost),
-          port: Number(options.port ?? app.settings.httpPort),
-          noAuth: (options.auth ?? app.settings.httpAuth) === 'none',
-        };
-        const endpoint = await startHttp(app, http);
-        process.stderr.write(
-          JSON.stringify({ listening: endpoint.url, instanceId: app.instanceId }) + '\n',
-        );
-      }
-    } catch (error) {
-      await app.close();
-      throw error;
+      await watch.closed;
+    } finally {
+      watch.close();
+      process.removeListener('SIGINT', stop);
+      process.removeListener('SIGTERM', stop);
     }
     return;
   }
@@ -161,14 +204,28 @@ export async function main(argv = process.argv.slice(2)) {
   } finally {
     await store.close();
   }
-  // 默认优先选择 HTTP 服务；多个 stdio 实例并存时不能猜测目标，需明确指定。
+  // 默认优先选择统一执行服务；旧实例并存时保留显式选择。
   const instance = options.instance
     ? instances.find((item) => item.id === options.instance)
-    : (instances.find((item) => item.mode === 'http') ??
+    : (instances.find((item) => item.role === 'execution_service') ??
+      instances.find((item) => item.mode === 'http') ??
       (instances.length === 1 ? instances[0] : undefined));
   if (options.instance && !instance) fail('INSTANCE_UNAVAILABLE', '指定实例不存在或已退出。');
   if (group === 'service' && (sub === 'instances' || sub === 'status')) {
-    output(instances.map(({ nonce: _nonce, ...item }) => item));
+    output(
+      await Promise.all(
+        instances.map(async ({ nonce: _nonce, ...item }) => {
+          const original = instances.find((i) => i.id === item.id)!;
+          if (item.role !== 'execution_service')
+            return { ...item, role: 'legacy', phase: 'ready', lifecyclePolicy: 'persistent' };
+          try {
+            return (await adminRequest(original, '_service_status', {})).data;
+          } catch {
+            return { ...item, available: false };
+          }
+        }),
+      ),
+    );
     return;
   }
   if (group === 'interaction' && sub === 'attach') {
@@ -549,4 +606,15 @@ export function reportFailure(error: unknown) {
   const detail = errorDetail(error);
   process.stderr.write(JSON.stringify({ ok: false, error: detail }) + '\n');
   process.exitCode = detail.code === 'CONFIG_INVALID' ? 2 : detail.code === 'CANCELLED' ? 130 : 1;
+}
+
+/** 手动新建服务读取已保存的 HTTP 默认值，不依赖配置导出文件。 */
+async function savedHttpSettings(databasePath: string) {
+  const store = await SqliteStore.open(databasePath);
+  try {
+    const meta = await store.get<{ settings: unknown }>('meta', 'connector');
+    return settingsSchema.parse(meta?.settings ?? {});
+  } finally {
+    await store.close();
+  }
 }

@@ -1,12 +1,18 @@
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
-import { McpServer, ResourceTemplate, inputRequired } from '@modelcontextprotocol/server';
+import {
+  McpServer,
+  ResourceTemplate,
+  inputRequired,
+  CLIENT_CAPABILITIES_META_KEY,
+} from '@modelcontextprotocol/server';
 import type {
   CallToolResult,
   ListToolsResult,
   McpRequestContext,
   ServerContext,
   ElicitRequestFormParams,
+  ClientCapabilities,
 } from '@modelcontextprotocol/server';
 import type { Container } from '../../bootstrap/container.js';
 import type { Context } from '../../domain/models.js';
@@ -21,7 +27,16 @@ import { collaborationGuidance } from '../../domain/collaboration.js';
 // 重入状态按 Container 保存，支持现代 HTTP 下一次请求创建新 server 后继续同一交互。
 const presentations = new WeakMap<
   Container,
-  Map<string, { principalId: string; interactionId: string; revision: number; expires: number }>
+  Map<
+    string,
+    {
+      principalId: string;
+      interactionId: string;
+      revision: number;
+      expires: number;
+      connectionId?: string | undefined;
+    }
+  >
 >();
 const result = (data: Record<string, unknown>): CallToolResult => ({
   content: [{ type: 'text', text: JSON.stringify(data) }],
@@ -73,7 +88,8 @@ export function createServer(
           !state ||
           state.principalId !== ctx.principalId ||
           state.interactionId !== interactionId ||
-          state.revision !== record.revision
+          state.revision !== record.revision ||
+          (ctx.mode === 'stdio' && state.connectionId !== ctx.connectionId)
         )
           fail('INTERACTION_CHANNEL_UNAVAILABLE', '交互重入凭证无效、过期或归属已变化。');
         response = request.mcpReq.inputResponses?.answer;
@@ -83,6 +99,7 @@ export function createServer(
         const nonce = randomBytes(32).toString('base64url');
         pending.set(nonce, {
           principalId: ctx.principalId,
+          connectionId: ctx.connectionId,
           interactionId,
           revision: record.revision,
           expires: Date.now() + 600_000,
@@ -162,7 +179,13 @@ export function createServer(
         annotations: toolAnnotations(definition),
       },
       async (args, request) => {
-        const capabilities = server.server.getClientCapabilities();
+        // SDK 2.0 的 envelope 声明为空对象；运行时已按协议校验，此处补充实际保留字段类型。
+        const envelope = request.mcpReq.envelope as
+          { [CLIENT_CAPABILITIES_META_KEY]?: ClientCapabilities } | undefined;
+        const capabilities =
+          transport.era === 'modern'
+            ? envelope?.[CLIENT_CAPABILITIES_META_KEY]
+            : server.server.getClientCapabilities();
         const ctx = {
           ...identity,
           signal: request.mcpReq.signal,
@@ -170,6 +193,7 @@ export function createServer(
             !!capabilities?.elicitation &&
             (transport.era === 'modern' || identity.mode === 'stdio'),
         };
+        app.channels?.update(ctx);
         try {
           await app.identities.check(ctx);
           if (definition.name === 'interaction_present') return await present(ctx, args, request);

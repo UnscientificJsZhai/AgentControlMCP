@@ -38,10 +38,12 @@ export class SqliteStore {
         );
       else pending?.resolve(response.value);
     });
-    const unavailable = () => {
+    const unavailable = (error?: unknown) => {
       this.unavailable = true;
+      const sqliteCode = (error as { errcode?: unknown } | undefined)?.errcode;
+      const details = typeof sqliteCode === 'number' ? { sqliteCode } : {};
       for (const pending of this.pending.values())
-        pending.reject(new AppError('STORAGE_UNAVAILABLE', '存储 Worker 已退出。'));
+        pending.reject(new AppError('STORAGE_UNAVAILABLE', '存储 Worker 已退出。', details));
       this.pending.clear();
     };
     this.worker.on('error', unavailable);
@@ -118,8 +120,12 @@ export class SqliteStore {
     return this.call<T | null>('replay', input);
   }
 
+  commitGuard:
+    | ((input: Transaction, action: () => Promise<CommitResult>) => Promise<CommitResult>)
+    | undefined;
   commit(input: Transaction) {
-    return this.call<CommitResult>('commit', input);
+    const action = () => this.call<CommitResult>('commit', input);
+    return this.commitGuard ? this.commitGuard(input, action) : action();
   }
 
   /** 安装和手动文件作业共用此恢复规则，仅接管已确认退出的持有者。 */

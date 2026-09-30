@@ -2,6 +2,7 @@ import { RequestError } from '@agentclientprotocol/sdk';
 import type { CreateTerminalRequest, TerminalOutputResponse } from '@agentclientprotocol/sdk';
 import { StringDecoder } from 'node:string_decoder';
 import { AppError, fail } from '../../domain/errors.js';
+import type { ActivityLease } from '../../domain/service-lifecycle.js';
 import { id } from '../../domain/ids.js';
 import { checkedPath } from './file-callbacks.js';
 import { ProcessHost } from './process-host.js';
@@ -33,6 +34,7 @@ interface PendingTerminal {
 
 /** 管理 ACP 创建的命令进程及有限输出缓存；所有查询均绑定原 Runtime，不能跨连接使用。 */
 export class TerminalManager {
+  acquireActivity: (() => ActivityLease) | undefined;
   private readonly terminals = new Map<string, Terminal>();
   private readonly pending = new Set<PendingTerminal>();
   private readonly closing = new Map<string, Promise<void>>();
@@ -58,6 +60,8 @@ export class TerminalManager {
       occupied.filter((terminal) => terminal.runtimeId === runtimeId).length >= 4
     )
       fail('CAPACITY_EXCEEDED', '已达到终端数量上限。');
+    const activity = this.acquireActivity?.();
+    let handedOff = false;
     let finish!: () => void;
     const pending: PendingTerminal = {
       runtimeId,
@@ -124,6 +128,8 @@ export class TerminalManager {
       host.stdout.on('data', append);
       host.stderr.on('data', append);
       this.terminals.set(terminal.id, terminal);
+      handedOff = true;
+      void terminal.host.closed.then(() => activity?.release());
       host = undefined;
       return { terminalId: terminal.id };
     } finally {
@@ -132,6 +138,7 @@ export class TerminalManager {
       } finally {
         signal.removeEventListener('abort', abort);
         this.pending.delete(pending);
+        if (!handedOff) activity?.release();
         finish();
       }
     }

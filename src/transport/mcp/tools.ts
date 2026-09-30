@@ -154,7 +154,7 @@ export function createTools(app: Container): ToolDefinition[] {
     (ctx) => ({
       apiVersion: 1,
       principalId: ctx.principalId,
-      mode: app.mode,
+      mode: ctx.mode,
       connectorInstanceId: app.instanceId,
       serviceId: app.serviceId,
       protocols: { acp: 1, acpSdk: '1.4.0', mcp: ['2026-07-28', '2025-11-25'], mcpSdk: '2.0.0' },
@@ -974,7 +974,13 @@ async function executeTool(
   const definition = definitions.find((tool) => tool.name === name);
   if (!definition) fail('CONFIG_INVALID', '工具不存在。', { name });
   const target = definition.resolveOperation?.(args) ?? { definition, input: args };
-  const data = await target.definition.run(ctx, target.input);
+  const lease = app.activity?.lifecycle.acquire('work', 'mcp_request');
+  let data: unknown;
+  try {
+    data = await target.definition.run(ctx, target.input);
+  } finally {
+    lease?.release();
+  }
   await app.identities.check(ctx);
   if (target.definition.readOnly)
     await reauthorizeResult(app, ctx, target.definition.name, target.input, data);

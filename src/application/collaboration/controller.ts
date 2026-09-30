@@ -31,6 +31,7 @@ import type { SqliteStore } from '../../infrastructure/storage/sqlite-store.js';
 import type { Row } from '../../infrastructure/storage/protocol.js';
 import { row } from '../../infrastructure/storage/sqlite-store.js';
 import { inside } from '../../infrastructure/platform/file-callbacks.js';
+import type { InteractionChannelRegistry } from '../interaction-channel-registry.js';
 import type { ConfigService } from '../config-service.js';
 import type { AgentAvailabilityService } from '../agent-availability-service.js';
 import type { TaskService } from '../task-service.js';
@@ -51,6 +52,7 @@ export interface CollaborationDependencies {
   auth: AuthService;
   settings: Settings;
   instanceId: string;
+  channels?: InteractionChannelRegistry;
 }
 export interface SpawnInput {
   requestId: string;
@@ -85,6 +87,7 @@ export class CollaborationController {
   readonly runtimes;
   readonly operations;
   stopping = false;
+  private readonly acceptedChannels = new Map<string, { context: Context; release: () => void }>();
   revokeBridge: (agentId: string) => Promise<void> = async () => {};
 
   constructor(
@@ -99,7 +102,15 @@ export class CollaborationController {
   }
 
   context(team: TeamRecord, agent: ManagedAgentRecord): Context {
-    return { ...team.context, managedAgentId: agent.id };
+    const stable = { ...team.context };
+    delete stable.nativeInteraction;
+    const transient = this.acceptedChannels.get(agent.id)?.context ?? stable;
+    return {
+      ...stable,
+      ...transient,
+      managedAgentId: agent.id,
+      nativeInteraction: this.app.channels?.available(transient) ?? false,
+    };
   }
 
   async team(ctx: Context, teamId: string, mutate = false) {
@@ -195,6 +206,10 @@ export class CollaborationController {
       checks: [{ kind: 'collab_agent', id: agent.id, revision: agent.revision }],
       puts: [row('collab_agent', next)],
     });
+    if (next.lifecycle !== 'starting') {
+      this.acceptedChannels.get(agent.id)?.release();
+      this.acceptedChannels.delete(agent.id);
+    }
     return next;
   }
 
@@ -283,158 +298,182 @@ export class CollaborationController {
   }
 
   async spawn(ctx: Context, args: SpawnInput) {
-    return this.storage.serial.run('spawn', async () => {
-      const previous = await this.app.store.replay<{
-        teamId: string;
-        agentId: string;
-        intentId?: string;
-        configId?: string;
-        configRevision?: number;
-      }>(this.storage.request(ctx, 'spawn_agent', args));
-      if (previous) {
-        await this.team(ctx, previous.teamId);
-        return {
-          ...previous,
-          intentId: previous.intentId ?? (await this.storage.intents(previous.agentId))[0]?.id,
-          nextAction: this.waitAction(ctx, previous.teamId),
-        };
-      }
-      this.checkTaskSize(args.message, args.completionCriteria);
-      if (this.stopping) fail('INSTANCE_UNAVAILABLE', '实例正在停止。');
-      if (ctx.collaborationMember && args.teamId && args.teamId !== ctx.collaborationMember.teamId)
-        fail('ACCESS_DENIED', 'Bridge 不能切换团队。');
-      const parent = ctx.collaborationMember
-        ? await this.agent(ctx.collaborationMember.agentId)
-        : undefined;
-      const profile =
-        args.profile ?? parent?.configId ?? this.app.settings.collaborationDefaultProfile;
-      const availability = await this.app.availability.snapshot();
-      const configs = availability.profiles
-        .filter((p) => p.availability.ready)
-        .map((p) => p.record);
-      if (!configs.length)
-        throw new AppError(
-          'AGENT_SETUP_REQUIRED',
-          '当前没有可用的 Agent profile。',
-          { phase: this.app.availability.phase(ctx, availability) },
-          '调用 discover_agents 查看原因并接入现有 Agent；只有用户明确指定目标后才能安装。',
-        );
-      const matches = profile
-        ? configs.filter((c) => c.id === profile || c.config.name === profile)
-        : configs;
-      if (matches.length !== 1)
-        fail(
-          'CONFIG_INVALID',
-          '请选择唯一的可用 profile；调用 discover_agents 查看接入状态。不会自动安装或替换所选 Agent。',
-          {
-            profiles: configs.map((c) => ({ profile: c.id, name: c.config.name })),
-          },
-        );
-      let config = matches[0]!;
-      this.checkConfig(config.id, args.completionCriteria);
-      if (parent) {
-        if (config.id !== parent.configId)
-          fail(
-            'ACCESS_DENIED',
-            '子成员只能使用父成员已授权的 profile；跨 profile 请由外部根创建成员。',
-          );
-        // 旧父成员不能借当前配置的新修订取得新增凭据、MCP 服务或更宽松模式。
-        config = await this.app.configs.get(parent.configId, parent.configRevision);
-      }
-      const teamId = ctx.collaborationMember?.teamId ?? args.teamId;
-      if (teamId) await this.renew(ctx, teamId);
-      const existing = teamId ? await this.team(ctx, teamId, true) : null;
-      const cwd = await realpath(
-        args.cwd ?? parent?.cwd ?? existing?.cwd ?? config.config.cwd ?? process.cwd(),
-      );
-      if (parent && !inside(parent.cwd, cwd))
-        fail('ACCESS_DENIED', '子成员目录不能超出父成员工作区。');
-      const team: TeamRecord = existing ?? {
-        id: id('team'),
-        revision: 1,
-        createdAt: now(),
-        schemaVersion: collaborationSchemaVersion,
-        ownerId: ctx.principalId,
-        instanceId: this.app.instanceId,
-        cwd,
-        sequence: '0',
-        context: {
-          principalId: ctx.principalId,
-          serviceId: ctx.serviceId,
-          mode: ctx.mode,
-          ...(ctx.credentialId ? { credentialId: ctx.credentialId } : {}),
-          ...(ctx.nativeInteraction ? { nativeInteraction: true } : {}),
-        },
-      };
-      return this.storage.serial.run(team.id, async () => {
-        if (parent && ['closing', 'closed'].includes((await this.agent(parent.id)).lifecycle))
-          fail('AGENT_CLOSED', '父成员正在关闭。');
-        const members = await this.members(team.id);
+    const release = this.app.channels?.retainAccepted(ctx);
+    let transferred = false;
+    try {
+      return await this.storage.serial.run('spawn', async () => {
+        const previous = await this.app.store.replay<{
+          teamId: string;
+          agentId: string;
+          intentId?: string;
+          configId?: string;
+          configRevision?: number;
+        }>(this.storage.request(ctx, 'spawn_agent', args));
+        if (previous) {
+          await this.team(ctx, previous.teamId);
+          return {
+            ...previous,
+            intentId: previous.intentId ?? (await this.storage.intents(previous.agentId))[0]?.id,
+            nextAction: this.waitAction(ctx, previous.teamId),
+          };
+        }
+        this.checkTaskSize(args.message, args.completionCriteria);
+        if (this.stopping) fail('INSTANCE_UNAVAILABLE', '实例正在停止。');
         if (
-          members.filter((a) => a.lifecycle !== 'closed').length >=
-          this.app.settings.collaborationMaxAgents
+          ctx.collaborationMember &&
+          args.teamId &&
+          args.teamId !== ctx.collaborationMember.teamId
         )
-          fail('CAPACITY_EXCEEDED', '团队成员已达上限。');
-        const path = `${parent?.path ?? '/root'}/${args.taskName}`;
-        if (path.split('/').length - 2 > this.app.settings.collaborationMaxDepth)
-          fail('CAPACITY_EXCEEDED', '子成员深度已达上限。');
-        if (members.some((a) => a.path === path))
-          fail('AGENT_PATH_CONFLICT', '此团队中的成员路径已经使用。');
-        await this.storage.capacity(
-          bytes(args),
-          this.app.settings.historyMaxBytes,
-          this.app.settings.minimumFreeBytes,
+          fail('ACCESS_DENIED', 'Bridge 不能切换团队。');
+        const parent = ctx.collaborationMember
+          ? await this.agent(ctx.collaborationMember.agentId)
+          : undefined;
+        const profile =
+          args.profile ?? parent?.configId ?? this.app.settings.collaborationDefaultProfile;
+        const availability = await this.app.availability.snapshot();
+        const configs = availability.profiles
+          .filter((p) => p.availability.ready)
+          .map((p) => p.record);
+        if (!configs.length)
+          throw new AppError(
+            'AGENT_SETUP_REQUIRED',
+            '当前没有可用的 Agent profile。',
+            { phase: this.app.availability.phase(ctx, availability) },
+            '调用 discover_agents 查看原因并接入现有 Agent；只有用户明确指定目标后才能安装。',
+          );
+        const matches = profile
+          ? configs.filter((c) => c.id === profile || c.config.name === profile)
+          : configs;
+        if (matches.length !== 1)
+          fail(
+            'CONFIG_INVALID',
+            '请选择唯一的可用 profile；调用 discover_agents 查看接入状态。不会自动安装或替换所选 Agent。',
+            {
+              profiles: configs.map((c) => ({ profile: c.id, name: c.config.name })),
+            },
+          );
+        let config = matches[0]!;
+        this.checkConfig(config.id, args.completionCriteria);
+        if (parent) {
+          if (config.id !== parent.configId)
+            fail(
+              'ACCESS_DENIED',
+              '子成员只能使用父成员已授权的 profile；跨 profile 请由外部根创建成员。',
+            );
+          // 旧父成员不能借当前配置的新修订取得新增凭据、MCP 服务或更宽松模式。
+          config = await this.app.configs.get(parent.configId, parent.configRevision);
+        }
+        const teamId = ctx.collaborationMember?.teamId ?? args.teamId;
+        if (teamId) await this.renew(ctx, teamId);
+        const existing = teamId ? await this.team(ctx, teamId, true) : null;
+        const cwd = await realpath(
+          args.cwd ??
+            parent?.cwd ??
+            existing?.cwd ??
+            config.config.cwd ??
+            ctx.startupCwd ??
+            process.cwd(),
         );
-        const agent: ManagedAgentRecord = {
-          id: id('agent'),
+        if (parent && !inside(parent.cwd, cwd))
+          fail('ACCESS_DENIED', '子成员目录不能超出父成员工作区。');
+        const team: TeamRecord = existing ?? {
+          id: id('team'),
           revision: 1,
           createdAt: now(),
-          teamId: team.id,
-          parentId: parent?.id ?? 'root',
-          path,
-          configId: config.id,
-          configRevision: config.revision,
+          schemaVersion: collaborationSchemaVersion,
+          ownerId: ctx.principalId,
+          instanceId: this.app.instanceId,
           cwd,
-          lifecycle: 'starting',
-          mailAfter: '0',
-          bridge: 'unconnected',
+          sequence: '0',
+          context: {
+            principalId: ctx.principalId,
+            serviceId: ctx.serviceId,
+            mode: ctx.mode,
+            ...(ctx.credentialId ? { credentialId: ctx.credentialId } : {}),
+          },
         };
-        const intent: TaskIntentRecord = {
-          id: id('intent'),
-          revision: 1,
-          createdAt: now(),
-          teamId: team.id,
-          agentId: agent.id,
-          order: '1',
-          message: args.message,
-          ...(args.completionCriteria ? { completionCriteria: args.completionCriteria } : {}),
-          state: 'queued',
-        };
-        const response = {
-          teamId: team.id,
-          agentId: agent.id,
-          intentId: intent.id,
-          path,
-          state: 'starting',
-          configId: agent.configId,
-          configRevision: agent.configRevision,
-          nextAction: this.waitAction(ctx, team.id),
-        };
-        await this.app.store.commit({
-          maxLogicalBytes: this.app.settings.historyMaxBytes,
-          checks: existing ? [] : [{ kind: 'collab_team', id: team.id, absent: true }],
-          puts: [
-            ...(existing ? [] : [row('collab_team', team)]),
-            row('collab_agent', agent),
-            row('collab_intent', intent),
-          ],
-          claims: [{ key: `collab_path:${team.id}:${path}`, holder: agent.id }],
-          idempotency: this.storage.request(ctx, 'spawn_agent', args, response),
+        return this.storage.serial.run(team.id, async () => {
+          if (parent && ['closing', 'closed'].includes((await this.agent(parent.id)).lifecycle))
+            fail('AGENT_CLOSED', '父成员正在关闭。');
+          const members = await this.members(team.id);
+          if (
+            members.filter((a) => a.lifecycle !== 'closed').length >=
+            this.app.settings.collaborationMaxAgents
+          )
+            fail('CAPACITY_EXCEEDED', '团队成员已达上限。');
+          const path = `${parent?.path ?? '/root'}/${args.taskName}`;
+          if (path.split('/').length - 2 > this.app.settings.collaborationMaxDepth)
+            fail('CAPACITY_EXCEEDED', '子成员深度已达上限。');
+          if (members.some((a) => a.path === path))
+            fail('AGENT_PATH_CONFLICT', '此团队中的成员路径已经使用。');
+          await this.storage.capacity(
+            bytes(args),
+            this.app.settings.historyMaxBytes,
+            this.app.settings.minimumFreeBytes,
+          );
+          const agent: ManagedAgentRecord = {
+            id: id('agent'),
+            revision: 1,
+            createdAt: now(),
+            teamId: team.id,
+            parentId: parent?.id ?? 'root',
+            path,
+            configId: config.id,
+            configRevision: config.revision,
+            cwd,
+            lifecycle: 'starting',
+            mailAfter: '0',
+            bridge: 'unconnected',
+          };
+          const intent: TaskIntentRecord = {
+            id: id('intent'),
+            revision: 1,
+            createdAt: now(),
+            teamId: team.id,
+            agentId: agent.id,
+            order: '1',
+            message: args.message,
+            ...(args.completionCriteria ? { completionCriteria: args.completionCriteria } : {}),
+            state: 'queued',
+          };
+          const response = {
+            teamId: team.id,
+            agentId: agent.id,
+            intentId: intent.id,
+            path,
+            state: 'starting',
+            configId: agent.configId,
+            configRevision: agent.configRevision,
+            nextAction: this.waitAction(ctx, team.id),
+          };
+          await this.app.store.commit({
+            maxLogicalBytes: this.app.settings.historyMaxBytes,
+            checks: existing ? [] : [{ kind: 'collab_team', id: team.id, absent: true }],
+            puts: [
+              ...(existing ? [] : [row('collab_team', team)]),
+              row('collab_agent', agent),
+              row('collab_intent', intent),
+            ],
+            claims: [{ key: `collab_path:${team.id}:${path}`, holder: agent.id }],
+            idempotency: this.storage.request(ctx, 'spawn_agent', args, response),
+          });
+          if (ctx.mode === 'http') {
+            const transient: Context = { ...team.context };
+            if (ctx.connectionId) transient.connectionId = ctx.connectionId;
+            if (ctx.interactionAdmissionId)
+              transient.interactionAdmissionId = ctx.interactionAdmissionId;
+            if (release) {
+              this.acceptedChannels.set(agent.id, { context: transient, release });
+              transferred = true;
+            }
+          }
+          this.scheduler.wake();
+          return response;
         });
-        this.scheduler.wake();
-        return response;
       });
-    });
+    } finally {
+      if (!transferred) release?.();
+    }
   }
 
   private checkConfig(configId: string, criteria?: CompletionCriteria) {
@@ -1267,6 +1306,8 @@ export class CollaborationController {
   }
   async shutdown() {
     this.stopping = true;
+    for (const entry of this.acceptedChannels.values()) entry.release();
+    this.acceptedChannels.clear();
     await this.scheduler.stop();
     for (const team of await this.app.store.list<TeamRecord>('collab_team')) {
       if (team.instanceId !== this.app.instanceId) continue;

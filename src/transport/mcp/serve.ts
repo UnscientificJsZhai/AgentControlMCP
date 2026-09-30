@@ -1,9 +1,11 @@
 import { createServer as httpServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server as HttpServer } from 'node:http';
+import { id } from '../../domain/ids.js';
 import { once } from 'node:events';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { serveStdio, StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { hostHeaderValidation, toNodeHandler } from '@modelcontextprotocol/node';
+import type { ActivityLease } from '../../domain/service-lifecycle.js';
 import type { Container } from '../../bootstrap/container.js';
 import { errorDetail, fail } from '../../domain/errors.js';
 import { createServer } from './server.js';
@@ -41,10 +43,10 @@ export function startStdio(app: Container, clientId: string, toolset: Toolset = 
 }
 
 export interface HttpOptions {
-  toolset?: Toolset;
+  toolset?: Toolset | undefined;
   host: string;
   port: number;
-  noAuth?: boolean;
+  noAuth?: boolean | undefined;
 }
 
 export function validateHttpOptions(options: HttpOptions) {
@@ -99,8 +101,23 @@ export async function startHttp(
       ? app.identities.registerAnonymous(headers.get('x-agent-client-id') ?? '')
       : app.identities.authenticate(headers.get('authorization') ?? undefined);
   const handler = createMcpHandler(
-    async (request) =>
-      createServer(app, await identity(request.requestInfo!.headers), request, options.toolset),
+    async (request) => {
+      const ctx = {
+        ...(await identity(request.requestInfo!.headers)),
+        connectionId: id('http_request'),
+      };
+      app.channels.register(ctx.connectionId, ctx.principalId);
+      const server = createServer(app, ctx, request, options.toolset);
+      const previous = server.server.onclose;
+      const remove = () => app.channels.remove(ctx.connectionId);
+      request.requestInfo!.signal.addEventListener('abort', remove, { once: true });
+      server.server.onclose = () => {
+        remove();
+        request.requestInfo!.signal.removeEventListener('abort', remove);
+        previous?.();
+      };
+      return server;
+    },
     {
       legacy: 'stateless',
       maxSubscriptions: 64,
@@ -110,8 +127,16 @@ export async function startHttp(
   const nodeHandler = toNodeHandler(handler);
   const guard = httpRequestGuard(options, app.settings);
   const server = httpServer((req, res) => {
+    let lease: ActivityLease | undefined;
+    const release = () => lease?.release();
+    res.once('close', release);
+    res.once('finish', release);
     void (async () => {
       if (!guard(req, res)) return;
+      lease = app.activity?.lifecycle.acquire(
+        'connection',
+        req.method === 'GET' ? 'http_subscription' : 'http_request',
+      );
       // 在读取请求正文前拒绝无效身份；正文仍按实际接收字节限制，不能只信任请求头。
       if (options.noAuth)
         await app.identities.registerAnonymous(String(req.headers['x-agent-client-id'] ?? ''));

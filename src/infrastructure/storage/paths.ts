@@ -1,6 +1,7 @@
 import { lstat, mkdir, mkdtemp, realpath, rm, statfs } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import { secureWindowsPath } from '../platform/service-launcher.js';
 import { fail } from '../../domain/errors.js';
 
 export interface StoragePaths {
@@ -93,6 +94,7 @@ export async function initializeStoragePaths(paths: StoragePaths): Promise<Stora
   for (const field of ['dataDir', 'configDir', 'stateDir', 'cacheDir'] as const) {
     await mkdir(result[field], { recursive: true, mode: 0o700 });
     result[field] = await realpath(result[field]);
+    await secureWindowsPath(result[field]);
   }
   result.contentDir = path.join(result.stateDir, 'content');
   result.databasePath = path.join(result.stateDir, 'state.db');
@@ -154,6 +156,7 @@ export async function createRuntimeDirectory(paths: StoragePaths) {
     await rm(directory, { recursive: true, force: true });
     fail('CONFIG_INVALID', '运行目录过长，请设置较短的 TMPDIR 或 XDG_RUNTIME_DIR。');
   }
+  await secureWindowsPath(directory);
   return directory;
 }
 

@@ -5,7 +5,10 @@ import {
 } from '../infrastructure/storage/paths.js';
 import type { StoragePaths } from '../infrastructure/storage/paths.js';
 import { StorageService } from '../application/storage-service.js';
-import { rm } from 'node:fs/promises';
+import { ServiceActivity } from '../application/service-activity.js';
+import { InteractionChannelRegistry } from '../application/interaction-channel-registry.js';
+import { isAlive } from '../application/recovery-service.js';
+import { realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type * as acp from '@agentclientprotocol/sdk';
@@ -75,6 +78,10 @@ export class Container {
   get dataDir() {
     return this.paths.dataDir;
   }
+  readonly channels = new InteractionChannelRegistry();
+  activity: ServiceActivity | undefined;
+  ensureHttp: ((options: unknown) => Promise<unknown>) | undefined;
+  serviceStatus: (() => unknown) | undefined;
   readonly terminals = new TerminalManager();
   readonly admin: Context;
   readonly attachedChannels = new Set<string>();
@@ -96,6 +103,7 @@ export class Container {
     this.admin = { principalId: 'local_admin', mode: 'cli', serviceId, admin: true };
     this.configs = new ConfigService(store, paths.configDir);
     this.operations = new OperationService(store, this.instanceId);
+    this.operations.retainInteraction = (ctx) => this.channels.retainAccepted(ctx);
     this.runtimes = new RuntimeService(
       store,
       this.configs,
@@ -184,7 +192,8 @@ export class Container {
       (channel === 'local_cli' &&
         (this.attachedChannels.has(ctx.principalId) ||
           this.attachedChannels.has(this.admin.principalId))) ||
-      (channel === 'mcp_native' && ctx.nativeInteraction === true);
+      (channel === 'mcp_native' &&
+        (this.activity ? this.channels.available(ctx) : ctx.nativeInteraction === true));
     // 先解除等待中的回调和终端，再结束任务与会话，最后由 Runtime 服务释放占用。
     this.runtimes.onClose = async (runtimeId, outputComplete) => {
       await this.interactions.cancel(runtimeId);
@@ -219,13 +228,34 @@ export class Container {
       dataDir?: string | undefined;
       mode?: Context['mode'];
       settings?: Partial<Settings>;
+      paths?: StoragePaths;
+      executionService?: { source: 'auto_stdio' | 'manual_http' };
     } = {},
   ) {
-    const paths = await initializeStoragePaths(resolveStoragePaths({ dataDir: options.dataDir }));
+    const paths = await initializeStoragePaths(
+      options.paths ?? resolveStoragePaths({ dataDir: options.dataDir }),
+    );
+    try {
+      paths.databasePath = await realpath(paths.databasePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     const store = await SqliteStore.open(paths.databasePath);
     let runtimeDirectory: string | undefined;
+    let owned: Container | undefined;
     try {
-      await recover(store);
+      try {
+        await recover(store);
+      } catch (error) {
+        if (!(error instanceof AppError && error.code === 'REVISION_CONFLICT')) throw error;
+      }
+      const active = (await store.list<InstanceRecord>('instance')).filter(
+        (i) => i.state === 'active' && isAlive(i.pid),
+      );
+      if (options.executionService && active.some((i) => !i.role && i.mode !== 'cli'))
+        fail('SERVICE_VERSION_CONFLICT', '存在旧版活动执行实例，请先停止旧服务再升级。');
+      if (!options.executionService && active.some((i) => i.role === 'execution_service'))
+        fail('RESOURCE_CONFLICT', '统一执行服务已运行，请通过管理 IPC 调用。');
       let meta = await store.get<{ serviceId: string; cursorKey: string; settings: Settings }>(
         'meta',
         'connector',
@@ -260,11 +290,36 @@ export class Container {
         meta.cursorKey,
         options.mode ?? 'cli',
       );
+      if (options.executionService) {
+        Object.assign(container.instance, {
+          role: 'execution_service',
+          launchSource: options.executionService.source,
+          lifecyclePolicy: options.executionService.source === 'auto_stdio' ? 'idle' : 'persistent',
+          phase: 'starting',
+        });
+      }
       await store.commit({
         puts: [row('instance', container.instance)],
-        claims:
-          container.mode === 'http' ? [{ key: 'http_service', holder: container.instanceId }] : [],
+        claims: options.executionService
+          ? [
+              { key: 'execution_service', holder: container.instanceId },
+              { key: 'http_service', holder: container.instanceId },
+            ]
+          : container.mode === 'http'
+            ? [{ key: 'http_service', holder: container.instanceId }]
+            : [],
       });
+      owned = container;
+      if (options.executionService) {
+        container.activity = new ServiceActivity(
+          container.instanceId,
+          container.settings.serviceIdleTimeoutMs,
+          options.executionService.source === 'auto_stdio' ? 'idle' : 'persistent',
+        );
+        store.commitGuard = (input, action) => container.activity!.commit(input, action);
+        container.terminals.acquireActivity = () =>
+          container.activity!.lifecycle.acquire('work', 'terminal');
+      }
       await container.registry.initialize();
       container.collaboration.start();
       await new SettingsService(store, paths.configDir).export();
@@ -288,6 +343,10 @@ export class Container {
       }
       return container;
     } catch (error) {
+      if (owned) {
+        await owned.close().catch(() => {});
+        throw error;
+      }
       if (runtimeDirectory) await rm(runtimeDirectory, { recursive: true, force: true });
       await store.close();
       throw error;
@@ -405,6 +464,7 @@ export class Container {
 
   /** 停止新维护工作，收敛下游任务，再写入实例终态；存储必须最后关闭。 */
   private async shutdown() {
+    this.activity?.lifecycle.beginDrain(true);
     clearInterval(this.timer);
     await this.availability.close();
     await this.collaboration.shutdown();
@@ -424,9 +484,20 @@ export class Container {
     const instance = await this.store.get<InstanceRecord>('instance', this.instanceId);
     if (instance)
       await this.store.commit({
-        puts: [row('instance', { ...instance, revision: instance.revision + 1, state: 'stopped' })],
-        releases: [{ key: 'http_service', holder: this.instanceId }],
+        puts: [
+          row('instance', {
+            ...instance,
+            revision: instance.revision + 1,
+            state: 'stopped',
+            ...(this.activity ? { phase: 'stopped' } : {}),
+          }),
+        ],
+        releases: [
+          { key: 'http_service', holder: this.instanceId },
+          { key: 'execution_service', holder: this.instanceId },
+        ],
       });
     await this.store.close();
+    this.activity?.lifecycle.stopped();
   }
 }

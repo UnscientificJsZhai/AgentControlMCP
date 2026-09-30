@@ -1,5 +1,7 @@
 import type { Socket } from 'node:net';
 import { createConnection, createServer } from 'node:net';
+import { StringDecoder } from 'node:string_decoder';
+import type { ActivityLease } from '../../domain/service-lifecycle.js';
 import { chmod, unlink } from 'node:fs/promises';
 import { timingSafeEqual, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
@@ -26,18 +28,21 @@ export async function startAdmin(app: Container) {
   const server = createServer((socket) => {
     sockets.add(socket);
     let buffer = '';
+    const decoder = new StringDecoder('utf8');
+    let activity: ActivityLease | undefined;
     let busy = false;
     let attached: string | undefined;
     socket.on('error', () => {});
     socket.on('close', () => {
       sockets.delete(socket);
+      activity?.release();
       if (attached) {
         presentationSessions.delete(attached);
         if (!presentationSessions.size) app.attachedChannels.delete(app.admin.principalId);
       }
     });
     socket.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
+      buffer += decoder.write(chunk);
       if (Buffer.byteLength(buffer) > 17 * 1024 ** 2) {
         socket.destroy();
         return;
@@ -51,7 +56,15 @@ export async function startAdmin(app: Container) {
         if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
           throw new AppError('UNAUTHENTICATED', '管理端点凭证无效。');
         // 附着凭证只存在于当前实例内存中，关闭附着连接后不能再据此签发审阅收据。
+        if (message.name === '_service_watch') {
+          socket.write(
+            JSON.stringify({ ok: true, data: { watching: true, instanceId: app.instanceId } }) +
+              '\n',
+          );
+          return;
+        }
         if (message.attach) {
+          activity = app.activity?.lifecycle.acquire('connection', 'cli_interaction');
           attached = randomBytes(32).toString('base64url');
           presentationSessions.add(attached);
           app.attachedChannels.add(app.admin.principalId);
@@ -61,6 +74,8 @@ export async function startAdmin(app: Container) {
           );
           return;
         }
+        if (!['_service_status', '_instances', '_stop'].includes(message.name))
+          activity = app.activity?.lifecycle.acquire('work', 'cli_request');
         const data = await adminCommand(
           app,
           message.name,
@@ -93,19 +108,22 @@ export function adminRequest(
   args: unknown,
   attach = false,
   presentationSession?: string,
-): Promise<{ data: unknown; close: () => void }> {
+  timeoutMs = 35_000,
+): Promise<{ data: unknown; close: () => void; closed: Promise<void> }> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(instance.endpoint);
     let buffer = '';
+    const decoder = new StringDecoder('utf8');
+    const closed = new Promise<void>((done) => socket.once('close', done));
     let received = false;
-    socket.setTimeout(35_000, () => socket.destroy(new AppError('TIMEOUT', '管理请求超时。')));
+    socket.setTimeout(timeoutMs, () => socket.destroy(new AppError('TIMEOUT', '管理请求超时。')));
     socket.once('connect', () =>
       socket.write(
         JSON.stringify({ nonce: instance.nonce, name, args, attach, presentationSession }) + '\n',
       ),
     );
     socket.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
+      buffer += decoder.write(chunk);
       if (Buffer.byteLength(buffer) > 17 * 1024 ** 2) {
         socket.destroy(new Error('管理响应过大'));
         return;
@@ -121,7 +139,7 @@ export function adminRequest(
         if (!response.ok) reject(new AppError(response.error!.code, response.error!.message));
         else {
           socket.setTimeout(0);
-          resolve({ data: response.data, close: () => socket.destroy() });
+          resolve({ data: response.data, close: () => socket.destroy(), closed });
         }
       } catch (error) {
         reject(error instanceof Error ? error : new Error('无效管理响应'));

@@ -39,7 +39,7 @@ export class SettingsService {
       documentId: 'connector' as const,
       kind: 'connector' as const,
       revision: meta.revision,
-      value: meta.settings,
+      value: settingsSchema.parse(meta.settings),
     };
   }
 

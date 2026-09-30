@@ -45,7 +45,10 @@ export async function recover(
       row('instance', { ...instance, revision: instance.revision + 1, state: 'stopped' }),
     ];
     const deletes: { kind: string; id: string }[] = [];
-    const releases = [{ key: 'http_service', holder: instance.id }];
+    const releases = [
+      { key: 'http_service', holder: instance.id },
+      { key: 'execution_service', holder: instance.id },
+    ];
     for (const kind of ['task', 'operation'] as const)
       for (const record of await store.list<WorkRecord>(kind))
         if (record.instanceId === instance.id && !terminalStates.has(record.state)) {

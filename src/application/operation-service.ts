@@ -19,6 +19,7 @@ export function operationUpdateEvent(work: WorkRecord): EventInput {
 
 /** 为安装、认证、恢复等长操作提供统一的持久化状态、幂等受理和实例内取消句柄。 */
 export class OperationService {
+  retainInteraction: (ctx: Context) => () => void = () => () => {};
   acceptRecords: (ctx: Context, work: WorkRecord) => Promise<Transaction> = () =>
     Promise.resolve({});
   terminalRecords: (work: WorkRecord) => Promise<Row[]> = () => Promise.resolve([]);
@@ -53,69 +54,77 @@ export class OperationService {
     action: (operationId: string, signal: AbortSignal) => Promise<unknown>,
     target: { sessionId?: string; runtimeId?: string } = {},
   ) {
-    const record: WorkRecord = {
-      id: id('op'),
-      revision: 1,
-      createdAt: now(),
-      kind: 'operation',
-      ownerId: ctx.principalId,
-      instanceId: this.instanceId,
-      type,
-      state: 'accepted',
-      commitState: 'pending',
-      ...target,
-      ...(type === 'session_create' && ctx.collaborationIntent
-        ? {
-            collaborationSetup: {
-              teamId: ctx.collaborationIntent.teamId,
-              agentId: ctx.collaborationIntent.agentId,
-              intentId: ctx.collaborationIntent.intentId,
-            },
-          }
-        : {}),
-    };
-    const additional = await this.acceptRecords(ctx, record);
-    const response = { operationId: record.id, state: 'accepted' };
-    const committed = await this.store.commit({
-      checks: additional.checks ?? [],
-      puts: [row('operation', record), ...(additional.puts ?? [])],
-      idempotency: idem(ctx, type, args, response),
-      ...(additional.idempotency ? { idempotencyAliases: [additional.idempotency] } : {}),
-    });
-    const accepted = committed.response as typeof response;
-    if (committed.replayed) {
-      await this.get(ctx, accepted.operationId);
-      return accepted;
-    }
-    const abort = new AbortController();
-    const done = new Promise<void>((resolve) => setImmediate(resolve)).then(async () => {
-      await this.update(record.id, { state: 'running' });
-      try {
-        abort.signal.throwIfAborted();
-        const result = await action(record.id, abort.signal);
-        const current = await this.store.get<WorkRecord>('operation', record.id);
-        if (current && !terminalStates.has(current.state))
+    const releaseInteraction = this.retainInteraction(ctx);
+    let transferred = false;
+    try {
+      const record: WorkRecord = {
+        id: id('op'),
+        revision: 1,
+        createdAt: now(),
+        kind: 'operation',
+        ownerId: ctx.principalId,
+        instanceId: this.instanceId,
+        type,
+        state: 'accepted',
+        commitState: 'pending',
+        ...target,
+        ...(type === 'session_create' && ctx.collaborationIntent
+          ? {
+              collaborationSetup: {
+                teamId: ctx.collaborationIntent.teamId,
+                agentId: ctx.collaborationIntent.agentId,
+                intentId: ctx.collaborationIntent.intentId,
+              },
+            }
+          : {}),
+      };
+      const additional = await this.acceptRecords(ctx, record);
+      const response = { operationId: record.id, state: 'accepted' };
+      const committed = await this.store.commit({
+        checks: additional.checks ?? [],
+        puts: [row('operation', record), ...(additional.puts ?? [])],
+        idempotency: idem(ctx, type, args, response),
+        ...(additional.idempotency ? { idempotencyAliases: [additional.idempotency] } : {}),
+      });
+      const accepted = committed.response as typeof response;
+      if (committed.replayed) {
+        await this.get(ctx, accepted.operationId);
+        return accepted;
+      }
+      const abort = new AbortController();
+      const done = new Promise<void>((resolve) => setImmediate(resolve)).then(async () => {
+        try {
+          await this.update(record.id, { state: 'running' });
+          abort.signal.throwIfAborted();
+          const result = await action(record.id, abort.signal);
+          const current = await this.store.get<WorkRecord>('operation', record.id);
+          if (current && !terminalStates.has(current.state))
+            await this.update(record.id, {
+              state:
+                abort.signal.aborted && current.commitState !== 'committed'
+                  ? 'cancelled'
+                  : 'completed',
+              result,
+              endedAt: now(),
+            });
+        } catch (error) {
           await this.update(record.id, {
-            state:
-              abort.signal.aborted && current.commitState !== 'committed'
-                ? 'cancelled'
-                : 'completed',
-            result,
+            state: abort.signal.aborted ? 'cancelled' : 'failed',
+            error: errorDetail(error),
             endedAt: now(),
           });
-      } catch (error) {
-        await this.update(record.id, {
-          state: abort.signal.aborted ? 'cancelled' : 'failed',
-          error: errorDetail(error),
-          endedAt: now(),
-        });
-      } finally {
-        this.active.delete(record.id);
-      }
-    });
-    this.active.set(record.id, { abort, done });
-    void done.catch(() => {});
-    return accepted;
+        } finally {
+          releaseInteraction();
+          this.active.delete(record.id);
+        }
+      });
+      this.active.set(record.id, { abort, done });
+      void done.catch(() => {});
+      transferred = true;
+      return accepted;
+    } finally {
+      if (!transferred) releaseInteraction();
+    }
   }
 
   /** 保持终态不可逆，也不允许迟到的 running 更新覆盖 cancelling。 */

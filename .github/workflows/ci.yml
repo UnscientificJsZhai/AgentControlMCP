@@ -43,10 +43,13 @@ jobs:
           path: |
             native/win32-x64/process-host.exe
             native/win32-arm64/process-host.exe
+            native/win32-x64/service-launcher.exe
+            native/win32-arm64/service-launcher.exe
           if-no-files-found: error
           # 保留重跑和本地复现所需的产物，覆盖 GitHub 的 30 天重跑窗口后自动清理。
           retention-days: 30
   check:
+    needs: windows-host
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -70,6 +73,10 @@ jobs:
           check-latest: true
           cache: npm
           cache-dependency-path: package-lock.json
+      - uses: actions/download-artifact@v7
+        with:
+          name: windows-process-host
+          path: native
       - name: Install locked dependencies
         run: npm ci
       - name: Run static checks, unit and component integration tests

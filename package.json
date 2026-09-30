@@ -9,7 +9,7 @@
     "node": ">=24.13.0 <25"
   },
   "scripts": {
-    "build": "node scripts/clean.mjs build && tsc -p tsconfig.build.json",
+    "build": "node scripts/clean.mjs build && tsc -p tsconfig.build.json && node scripts/write-service-build.mjs",
     "build:watch": "node scripts/clean.mjs build && tsc -p tsconfig.build.json --watch",
     "clean": "node scripts/clean.mjs",
     "typecheck": "tsc --noEmit",
@@ -17,14 +17,16 @@
     "lint:fix": "eslint . --fix --max-warnings 0",
     "format:check": "prettier . --check",
     "format": "prettier . --write",
-    "test": "npm run test:compile && node --test --test-timeout=5000 \".test-dist/test/{unit,integration}/**/*.test.js\"",
+    "test": "npm run test:compile && node --test --test-timeout=5000 \".test-dist/test/{unit,integration}/**/*.test.js\" && npm run test:process:compiled",
     "test:unit": "npm run test:compile:unit && node --test --test-timeout=5000 \".test-dist/test/unit/**/*.test.js\"",
     "test:integration": "npm run test:compile && node --test --test-timeout=5000 \".test-dist/test/integration/**/*.test.js\"",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run build && npm test",
     "test:compile": "node scripts/clean.mjs test && tsc -p tsconfig.test.json",
     "test:compile:unit": "node scripts/clean.mjs test && tsc -p tsconfig.test-unit.json",
     "build:windows-host": "node scripts/build-windows-host.mjs",
-    "prepack": "npm run build && node scripts/check-package.mjs"
+    "prepack": "npm run build && node scripts/check-package.mjs",
+    "test:process": "npm run test:compile && npm run build && node --test --test-timeout=20000 \".test-dist/test/process/**/*.test.js\"",
+    "test:process:compiled": "npm run build && node --test --test-timeout=20000 \".test-dist/test/process/**/*.test.js\""
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
@@ -37,6 +39,7 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "24.13.6",
     "@types/unbzip2-stream": "1.4.3",
     "@types/yauzl": "3.4.0",
@@ -56,7 +59,9 @@
     "docs/acceptance.md",
     "docs/mcp-tools.md",
     "docs/storage.md",
-    "docs/collaboration.md"
+    "docs/collaboration.md",
+    "docs/service-lifecycle.md",
+    "plan/feature-unified-execution-service-1*.md"
   ],
   "exports": {
     ".": "./dist/index.js"

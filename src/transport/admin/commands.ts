@@ -30,6 +30,11 @@ export async function adminCommand(
     const runtime = await app.runtimes.get(ctx, interaction.runtimeId);
     if (runtime.managedAgentId) ctx = { ...ctx, managedAgentId: runtime.managedAgentId };
   }
+  if (name === '_service_status') return app.serviceStatus?.() ?? { available: false };
+  if (name === '_ensure_http') {
+    if (!app.ensureHttp) fail('SERVICE_VERSION_CONFLICT', '此实例不支持统一服务 HTTP 接管。');
+    return app.ensureHttp(args);
+  }
   if (name === '_recovery_inspect') return new RecoveryAdminService(app).inspect();
   if (name === '_recovery_resolve')
     return new RecoveryAdminService(app).resolve(
@@ -157,7 +162,9 @@ export async function adminCommand(
   // 给当前 IPC 响应留出返回时间，再触发关闭；否则 CLI 可能只能观察到连接被截断。
   if (name === '_stop') {
     setTimeout(() => {
-      void app.close();
+      void app.close().catch(() => {
+        process.exitCode = 1;
+      });
     }, 50);
     return { stopping: true };
   }
