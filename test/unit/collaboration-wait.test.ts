@@ -8,6 +8,7 @@ import type {
   TeamRecord,
 } from '../../src/domain/collaboration.js';
 import type { Context, InteractionRecord, RuntimeRecord } from '../../src/domain/models.js';
+import { parseRespondAgentInput } from '../../src/transport/mcp/collaboration-tools.js';
 
 const root: Context = { principalId: 'owner', serviceId: 'test', mode: 'stdio' };
 const team: TeamRecord = {
@@ -151,12 +152,14 @@ void test('Empty supervision settles and active work times out without cancellin
   const empty = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
   assert.equal(empty.reason, 'settled');
   assert.equal(empty.timedOut, false);
+  assert.equal(empty.supervision.readyToSummarize, true);
   data.collab_agent.push(agent('a', '/root/a'));
   data.collab_intent.push(intent('task-a', 'a', 'queued'));
   const pending = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
   assert.equal(pending.reason, 'timeout');
   assert.equal(pending.timedOut, true);
   assert.equal(pending.supervision.queuedTasks.length, 1);
+  assert.equal(pending.supervision.executionSettled, false);
   assert.equal((data.collab_intent[0] as TaskIntentRecord).state, 'queued');
 });
 
@@ -191,6 +194,18 @@ void test('An unresolved approval survives cursor advancement and disappears on 
   setMessages([{ id: 'notice', body: { interactionId: approval.id }, type: 'INPUT_REQUIRED' }]);
   const first = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
   assert.equal(first.reason, 'input_required');
+  assert.equal(first.nextAction.tool, 'respond_agent');
+  assert.equal(first.supervision.readyToSummarize, false);
+  const choices = first.pendingInteractions[0]!.resolutionChoices!;
+  assert.deepEqual(
+    choices.map((choice) => choice.kind),
+    ['allow_once', 'reject_once', 'cancel'],
+  );
+  for (const choice of choices) {
+    assert.deepEqual(parseRespondAgentInput(choice.call.arguments), choice.call.arguments);
+    assert.ok(choice.call.arguments.requestId.length <= 128);
+  }
+  assert.equal(new Set(choices.map((choice) => choice.call.arguments.requestId)).size, 3);
   setMessages([]);
   const afterCursor = await controller.wait(root, {
     teamId: team.id,
@@ -199,6 +214,9 @@ void test('An unresolved approval survives cursor advancement and disappears on 
   });
   assert.equal(afterCursor.reason, 'input_required');
   assert.equal(afterCursor.pendingInteractions[0]?.interactionId, approval.id);
+  assert.deepEqual(afterCursor.pendingInteractions[0]?.resolutionChoices, choices);
+  assert.ok('choices' in afterCursor.nextAction);
+  assert.deepEqual(afterCursor.nextAction.choices, choices);
   approval.state = 'responded';
   assert.equal((await controller.wait(root, { teamId: team.id, timeoutMs: 0 })).reason, 'timeout');
   approval.state = 'pending';
@@ -236,6 +254,15 @@ void test('Root, parent and sibling receive only their visible current approvals
   const parentResult = await controller.wait(parent, { timeoutMs: 0 });
   assert.equal(parentResult.pendingInteractions.length, 1);
   assert.deepEqual(parentResult.pendingInteractions[0]?.delegableOptionIds, ['reject']);
+  assert.deepEqual(
+    parentResult.pendingInteractions[0]?.resolutionChoices?.map((choice) => choice.kind),
+    ['reject_once', 'cancel'],
+  );
+  assert.equal(parentResult.nextAction.tool, 'acm_respond_agent');
+  assert.equal(
+    parentResult.pendingInteractions[0]?.resolutionChoices?.[0]?.call.tool,
+    'acm_respond_agent',
+  );
   assert.match(
     parentResult.pendingInteractions[0].nextAction.instruction,
     /批准超出委托范围.*外部 root/,
@@ -267,6 +294,8 @@ void test('A member excludes its own work and cannot read a grandchild approval 
     { timeoutMs: 0 },
   );
   assert.deepEqual(result.pendingInteractions, []);
+  assert.equal(JSON.stringify(result).includes('"path":"/tmp/file"'), false);
+  assert.equal(JSON.stringify(result.agents).includes('"request"'), false);
   assert.deepEqual(
     result.supervision.unfinishedTasks.map((task) => task.intentId),
     ['grandchild-task'],
@@ -291,10 +320,18 @@ void test('Host permission guidance names the permitted decision for either dele
   const denied = await fixture(records).controller.wait(ctx, { timeoutMs: 0 });
   assert.ok(denied.pendingInteractions[0]);
   assert.equal(denied.pendingInteractions[0].mayApproveHost, false);
+  assert.deepEqual(
+    denied.pendingInteractions[0].resolutionChoices?.map((choice) => choice.allow),
+    [false, undefined],
+  );
   assert.match(denied.pendingInteractions[0].nextAction.instruction, /allow:false.*外部 root/);
   const allowed = await fixture(records, true).controller.wait(ctx, { timeoutMs: 0 });
   assert.ok(allowed.pendingInteractions[0]);
   assert.equal(allowed.pendingInteractions[0].mayApproveHost, true);
+  assert.deepEqual(
+    allowed.pendingInteractions[0].resolutionChoices?.map((choice) => choice.allow),
+    [true, false, undefined],
+  );
   assert.match(allowed.pendingInteractions[0].nextAction.instruction, /allow:true\|false/);
 });
 
@@ -349,10 +386,66 @@ void test('Partial completion, pause, task failure and acceptance failure remain
   });
   const result = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
   assert.equal(result.reason, 'blocked');
+  assert.equal(result.supervision.readyToSummarize, false);
   assert.equal(result.supervision.queuedTasks.length, 1);
   assert.deepEqual(
     result.supervision.failedTasks.map((task) => task.intentId),
     ['done', 'failed'],
   );
   assert.equal(result.timedOut, false);
+});
+
+void test('Execution completion is independent of a final mailbox message and pagination', async () => {
+  const { controller, setMessages } = fixture();
+  setMessages([{ id: 'message', body: { text: 'done' }, agentId: 'a', type: 'FINAL_ANSWER' }]);
+  const result = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
+  assert.equal(result.reason, 'message');
+  assert.equal(result.supervision.executionSettled, true);
+  assert.equal(result.supervision.readyToSummarize, true);
+  assert.equal(result.nextAction.tool, 'list_agents');
+  const read = controller.storage.mailbox.bind(controller.storage);
+  controller.storage.mailbox = async (...args) => ({ ...(await read(...args)), hasMore: true });
+  const paginated = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
+  assert.equal(paginated.supervision.executionSettled, true);
+  assert.equal(paginated.supervision.readyToSummarize, false);
+  assert.equal(paginated.nextAction.tool, 'wait_agent');
+  const abort = new AbortController();
+  abort.abort();
+  assert.equal(
+    (await controller.wait({ ...root, signal: abort.signal }, { teamId: team.id })).supervision
+      .readyToSummarize,
+    false,
+  );
+});
+
+void test('Non-permission and mixed pending inputs retain presentation and authentication guidance', async () => {
+  for (const type of ['form', 'url', 'terminal_auth'] as const) {
+    const input = { ...interaction(type), type, request: { message: 'input required' } };
+    const { controller, data } = fixture({
+      collab_agent: [agent('a', '/root/a')],
+      runtime: [runtime('a')],
+      interaction: [input],
+    });
+    const result = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
+    assert.equal(result.reason, 'input_required');
+    assert.equal(result.pendingInteractions[0]?.resolutionChoices, undefined);
+    assert.equal('choices' in result.nextAction, false);
+    assert.equal(result.nextAction.tool, 'respond_agent');
+    assert.equal(
+      'action' in result.nextAction && result.nextAction.action,
+      type === 'terminal_auth' ? 'reply' : 'present',
+    );
+    assert.match(result.nextAction.instruction, type === 'terminal_auth' ? /认证/ : /真实用户呈现/);
+    assert.equal(result.supervision.readyToSummarize, false);
+    data.interaction.push(interaction('permission'));
+    const mixed = await controller.wait(root, { teamId: team.id, timeoutMs: 0 });
+    assert.ok('choices' in mixed.nextAction);
+    assert.equal(mixed.nextAction.choices.length, 3);
+    assert.deepEqual(mixed.nextAction.interactions, [type, 'permission'].sort());
+    assert.match(mixed.nextAction.instruction, /各自 nextAction 真实呈现或认证/);
+    assert.match(
+      mixed.pendingInteractions.find((item) => item.type === type)!.nextAction.instruction,
+      /外部 root/,
+    );
+  }
 });

@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm, symlink, mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -134,6 +134,109 @@ async function call<T>(client: Client, name: string, args: Record<string, unknow
   const result = response.structuredContent as { ok: boolean; data: T; error?: unknown };
   assert.equal(result.ok, true, JSON.stringify(result.error));
   return result.data;
+}
+
+for (const modern of [false, true]) {
+  void test(`Approval validation returns structured field errors over ${modern ? 'modern' : 'legacy'} stdio`, async (t) => {
+    const env = await environment(t);
+    const { client } = await env.connect('approval', 'collaboration', modern);
+    const tools = await client.listTools();
+    const schema = tools.tools.find((tool) => tool.name === 'respond_agent')!.inputSchema;
+    assert.equal((schema.anyOf as unknown[]).length, 7);
+    const result = await client.callTool({
+      name: 'respond_agent',
+      arguments: {
+        requestId: 'malformed',
+        agentId: 'agent',
+        interactionId: 'interaction',
+        optionId: 'allow',
+        decision: { kind: 'host', allow: true },
+      },
+    });
+    assert.equal(result.isError, true);
+    const body = result.structuredContent as {
+      ok: boolean;
+      error: { code: string; details: { issues: { path: string[] }[] } };
+    };
+    assert.equal(body.ok, false);
+    assert.equal(body.error.code, 'CONFIG_INVALID');
+    assert.deepEqual(
+      body.error.details.issues.map((issue) => issue.path),
+      [['target'], ['action']],
+    );
+  });
+
+  void test(`Bridge preserves the strict response catalog and structured errors over ${modern ? 'modern' : 'legacy'} stdio`, async (t) => {
+    const env = await environment(t);
+    const { client } = await env.connect('bridge-owner', 'collaboration');
+    const registered = await call<{ configId: string }>(client, 'setup_agent', {
+      action: 'register',
+      arguments: {
+        config: {
+          name: 'bridge-fixture',
+          origin: { kind: 'manual' },
+          launch: {
+            kind: 'command',
+            executable: process.execPath,
+            args: [
+              resolve('test/fixtures/collaboration-permission-agent.mjs'),
+              join(env.dir, 'gate'),
+            ],
+          },
+          cwd: env.dir,
+        },
+        idempotencyKey: 'bridge-register',
+      },
+    });
+    const started = await call<{ agentId: string }>(client, 'spawn_agent', {
+      requestId: 'bridge-spawn',
+      taskName: 'bridge',
+      profile: registered.configId,
+      cwd: env.dir,
+      message: 'Wait for the fixture gate.',
+    });
+    const bindingPath = join(
+      dirname((await env.descriptor()).credentialPath),
+      `member-${started.agentId}.json`,
+    );
+    await until(async () =>
+      (await readFile(bindingPath, 'utf8').catch(() => undefined)) ? true : undefined,
+    );
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [entry, 'bridge', '--binding', bindingPath],
+      stderr: 'pipe',
+    });
+    transport.stderr?.on('data', () => {});
+    const bridge = new Client(
+      { name: 'bridge-validation', version: '1.0.0' },
+      modern ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {},
+    );
+    env.clients.push(bridge);
+    await bridge.connect(transport);
+    const tools = await bridge.listTools();
+    assert.equal(
+      (
+        tools.tools.find((tool) => tool.name === 'acm_respond_agent')!.inputSchema
+          .anyOf as unknown[]
+      ).length,
+      7,
+    );
+    assert.ok(tools.tools.every((tool) => tool.name.startsWith('acm_')));
+    const invalid = await bridge.callTool({
+      name: 'acm_respond_agent',
+      arguments: { requestId: 'bad', agentId: started.agentId, optionId: 'allow' },
+    });
+    assert.equal(invalid.isError, true);
+    const body = invalid.structuredContent as {
+      error: { code: string; details: { issues: { path: string[] }[] } };
+    };
+    assert.equal(body.error.code, 'CONFIG_INVALID');
+    assert.deepEqual(
+      body.error.details.issues.map((issue) => issue.path),
+      [['target'], ['action']],
+    );
+  });
 }
 async function info(client: Client) {
   return call<{ connectorInstanceId: string; principalId: string; mode: string }>(

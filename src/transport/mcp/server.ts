@@ -21,7 +21,7 @@ import { digest } from '../../domain/ids.js';
 import { invoke, createTools } from './tools.js';
 import { createMcpTools, describeTool, toolAnnotations } from './catalog.js';
 import type { Toolset } from './catalog.js';
-import { collaborationSchemas } from './collaboration-tools.js';
+import { parseRespondAgentInput } from './collaboration-tools.js';
 import { collaborationGuidance } from '../../domain/collaboration.js';
 
 // 重入状态按 Container 保存，支持现代 HTTP 下一次请求创建新 server 后继续同一交互。
@@ -175,7 +175,9 @@ export function createServer(
         description: definition.description,
         // 接入参数交由处理器按 action 严格校验，避免 SDK 抹掉联合分支的字段路径。
         // tools/list 仍发布下面 describeTool 生成的完整契约。
-        inputSchema: definition.name === 'setup_agent' ? z.looseObject({}) : definition.schema,
+        inputSchema: ['setup_agent', 'respond_agent'].includes(definition.name)
+          ? z.looseObject({})
+          : definition.schema,
         annotations: toolAnnotations(definition),
       },
       async (args, request) => {
@@ -198,7 +200,7 @@ export function createServer(
           await app.identities.check(ctx);
           if (definition.name === 'interaction_present') return await present(ctx, args, request);
           if (definition.name === 'respond_agent') {
-            const input = collaborationSchemas.respond_agent.parse(args);
+            const input = parseRespondAgentInput(args);
             if (input.action === 'present') {
               const replay = await app.collaboration.replayResponse(ctx, input);
               if (replay) return result({ ok: true, data: replay });

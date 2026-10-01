@@ -81,7 +81,9 @@ const managementNames = new Set([
 ]);
 
 /** MCP 注解帮助客户端呈现风险；它们不是授权机制，业务层仍需执行完整权限检查。 */
-export function toolAnnotations(tool: ToolDefinition) {
+export function toolAnnotations(
+  tool: Pick<ToolDefinition, 'readOnly' | 'destructive' | 'openWorld'>,
+) {
   return {
     readOnlyHint: tool.readOnly,
     destructiveHint: tool.destructive,
@@ -89,7 +91,12 @@ export function toolAnnotations(tool: ToolDefinition) {
   };
 }
 
-export function describeTool(tool: ToolDefinition) {
+export function describeTool(
+  tool: Pick<
+    ToolDefinition,
+    'name' | 'description' | 'schema' | 'readOnly' | 'destructive' | 'openWorld'
+  >,
+) {
   return {
     name: tool.name,
     description: tool.description,

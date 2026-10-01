@@ -1,11 +1,13 @@
 import { readFile, stat } from 'node:fs/promises';
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
-import type { CallToolResult } from '@modelcontextprotocol/server';
+import type { CallToolResult, ListToolsResult } from '@modelcontextprotocol/server';
+import { z } from 'zod';
 import { fail } from '../../domain/errors.js';
 import { collaborationBridge, collaborationGuidance } from '../../domain/collaboration.js';
 import { bindingSchema, bridgeRequest } from './ipc.js';
 import { collaborationDescriptions, collaborationSchemas } from '../mcp/collaboration-tools.js';
+import { describeTool } from '../mcp/catalog.js';
 
 /** 轻量 stdio 转发进程，不创建 Container、数据库连接或第二个 Agent 执行器。 */
 export async function startBridge(path: string) {
@@ -28,14 +30,24 @@ export async function startBridge(path: string) {
           instructions: `这是 AgentControlMCP 的专用 MCP Bridge，身份 ${JSON.stringify(handshake.data)}。只用本服务 agent_collaboration 的 acm_* 工具协作；/root 指外部上游调用者，与你所在客户端的原生 root/子 Agent 身份不同。发消息必须调用 acm_send_message，原生 send_message 或最终回答不能替代。新 Agent 看不到父历史；acm_spawn_agent.message 必须完整提供背景与交付标准。acm_send_message 不唤醒空闲成员。${collaborationGuidance(true)}`,
         },
       );
-      for (const [name, schema] of Object.entries(collaborationSchemas))
+      const definitions = Object.entries(collaborationSchemas).map(([name, schema]) => ({
+        name: `${collaborationBridge.toolPrefix}${name}`,
+        schema,
+        description: `AgentControlMCP Bridge 专用工具（agent_collaboration），/root 是外部上游。${collaborationDescriptions[name as keyof typeof collaborationSchemas].replace(/\b(spawn_agent|followup_task|wait_agent|respond_agent|list_agents)\b/g, (tool) => `${collaborationBridge.toolPrefix}${tool}`)}`,
+        readOnly: name === 'list_agents' || name === 'wait_agent',
+        destructive: name === 'close_agent',
+      }));
+      for (const definition of definitions)
         server.registerTool(
-          `${collaborationBridge.toolPrefix}${name}`,
+          definition.name,
           {
-            description: `AgentControlMCP Bridge 专用工具（agent_collaboration），/root 是外部上游。${collaborationDescriptions[name as keyof typeof collaborationSchemas].replace(/\b(spawn_agent|followup_task|wait_agent|respond_agent|list_agents)\b/g, (tool) => `${collaborationBridge.toolPrefix}${tool}`)}`,
-            inputSchema: schema,
+            description: definition.description,
+            // 宽入口只让后端返回字段错误，公开目录和已认证 IPC 仍按严格契约处理。
+            inputSchema:
+              definition.name === 'acm_respond_agent' ? z.looseObject({}) : definition.schema,
           },
           async (args: unknown): Promise<CallToolResult> => {
+            const name = definition.name.slice(collaborationBridge.toolPrefix.length);
             const response = (await bridgeRequest(binding, name, args)) as Record<string, unknown>;
             return {
               content: [{ type: 'text', text: JSON.stringify(response) }],
@@ -44,6 +56,10 @@ export async function startBridge(path: string) {
             };
           },
         );
+      server.server.setRequestHandler(
+        'tools/list',
+        () => ({ tools: definitions.map(describeTool) }) as ListToolsResult,
+      );
       return server;
     },
     { legacy: 'serve', onerror: () => {} },

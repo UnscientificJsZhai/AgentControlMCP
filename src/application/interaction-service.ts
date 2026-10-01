@@ -473,6 +473,9 @@ export class InteractionService {
       const session = record.sessionId
         ? await this.tasks.sessions.get(ctx, record.sessionId, 'control')
         : null;
+      // 定时器的落盘可能尚未执行；提交时仍必须检查实际截止时间。
+      if (record.expiresAt && Date.parse(record.expiresAt) <= Date.now())
+        fail('INTERACTION_EXPIRED', '交互已超过答复截止时间，请刷新待办。');
       await this.store.commit({
         checks: [
           { kind: 'interaction', id: record.id, revision: args.expectedRevision },

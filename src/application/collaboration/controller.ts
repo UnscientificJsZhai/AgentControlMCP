@@ -41,6 +41,7 @@ import type { AuthService } from '../auth-service.js';
 import type { Settings, PermissionPolicy } from '../../domain/schemas.js';
 import { CollaborationStore, completionRows } from './store.js';
 import { CollaborationScheduler } from './scheduler.js';
+import { permissionResolutionChoices } from './actions.js';
 
 export interface CollaborationDependencies {
   store: SqliteStore;
@@ -618,8 +619,8 @@ export class CollaborationController {
   private async visibleView(ctx: Context, agent: ManagedAgentRecord) {
     const view = await this.view(agent);
     const caller = ctx.collaborationMember?.agentId;
-    if (!caller || caller === agent.id || caller === agent.parentId) return view;
-    // 同级成员可协作寻址，但不能通过状态接口读取彼此的表单、审批或错误正文。
+    if (!caller || caller === agent.parentId) return view;
+    // 自身与同级成员可协作寻址；审批、表单及错误正文仅向实际监督者提供。
     return {
       agentId: view.agentId,
       teamId: view.teamId,
@@ -682,7 +683,16 @@ export class CollaborationController {
       tool: collaborationTool('wait_agent', Boolean(ctx.collaborationMember)),
       teamId,
       ...(cursor ? { cursor } : {}),
+      arguments: { teamId, timeoutMs: 10_000, ...(cursor ? { cursor } : {}) },
       instruction: '完成其他独立工作后继续等待；超时使用 nextCursor，hasMore 时继续读取。',
+    };
+  }
+
+  private responseAction(ctx: Context, teamId: string, response: object) {
+    return {
+      ...response,
+      teamId,
+      ...('nextAction' in response ? {} : { nextAction: this.waitAction(ctx, teamId) }),
     };
   }
 
@@ -700,18 +710,20 @@ export class CollaborationController {
       await this.app.store.listMatching<InteractionRecord>('interaction', 'runtimeId', [
         ...byRuntime.keys(),
       ])
-    ).filter((record) => {
-      const match = byRuntime.get(record.runtimeId);
-      return (
-        match &&
-        match.agent.lifecycle !== 'closed' &&
-        match.runtime.state !== 'closed' &&
-        record.state === 'pending' &&
-        record.instanceId === team.instanceId &&
-        record.connectionGeneration === match.runtime.connectionGeneration &&
-        (!record.expiresAt || Date.parse(record.expiresAt) > Date.now())
-      );
-    });
+    )
+      .filter((record) => {
+        const match = byRuntime.get(record.runtimeId);
+        return (
+          match &&
+          match.agent.lifecycle !== 'closed' &&
+          match.runtime.state !== 'closed' &&
+          record.state === 'pending' &&
+          record.instanceId === team.instanceId &&
+          record.connectionGeneration === match.runtime.connectionGeneration &&
+          (!record.expiresAt || Date.parse(record.expiresAt) > Date.now())
+        );
+      })
+      .sort((left, right) => left.id.localeCompare(right.id));
     const parentRuntime = parentId ? await this.runtimeFor(await this.agent(parentId)) : null;
     return Promise.all(
       pending.map(async (record) => {
@@ -750,6 +762,15 @@ export class CollaborationController {
               !(option && String((options[index] as { kind?: unknown }).kind).startsWith('reject')),
           );
         const tool = collaborationTool('respond_agent', Boolean(parentId));
+        const resolutionChoices = permissionResolutionChoices(
+          agent.id,
+          record,
+          tool,
+          parentId
+            ? delegatedOptions.filter((option): option is string => option !== null)
+            : undefined,
+          Boolean(mayApproveHost),
+        );
         const nextAction = isPermission
           ? {
               tool,
@@ -784,6 +805,7 @@ export class CollaborationController {
           type: record.type,
           request: record.request,
           options,
+          ...(isPermission ? { resolutionChoices } : {}),
           expiresAt: record.expiresAt,
           connectionGeneration: record.connectionGeneration,
           ...(parentId && isPermission
@@ -980,22 +1002,38 @@ export class CollaborationController {
           snapshot = undefined;
           continue;
         }
+        const executionSettled =
+          !pendingInteractions.length &&
+          !supervision.unfinishedTasks.length &&
+          !supervision.changingAgents.length &&
+          !supervision.blockedAgents.length;
+        const readyToSummarize = executionSettled && !page.hasMore && !ctx.signal?.aborted;
+        const permissionPending = pendingInteractions.filter((item) => item.resolutionChoices);
         const nextAction =
           reason === 'input_required'
-            ? {
-                instruction:
-                  '先处理或升级 pendingInteractions，再继续等待；不要反复立即调用等待工具。',
-                interactions: pendingInteractions.map((item) => item.interactionId),
-              }
+            ? permissionPending.length
+              ? {
+                  tool: permissionPending[0]!.nextAction.tool,
+                  instruction:
+                    '先审阅权限待办，选择 resolutionChoices 并使用 call.arguments 处理或升级；其他待办按各自 nextAction 真实呈现或认证，再继续等待。不要对同一待办反复调用等待工具。',
+                  interactions: pendingInteractions.map((item) => item.interactionId),
+                  choices: permissionPending.flatMap((item) => item.resolutionChoices ?? []),
+                }
+              : {
+                  ...pendingInteractions[0]!.nextAction,
+                  interactions: pendingInteractions.map((item) => item.interactionId),
+                }
             : reason === 'blocked'
               ? {
                   tool: collaborationTool('list_agents', Boolean(ctx.collaborationMember)),
                   instruction: `先检查 blockedAgents 的 cause、失败结果和队列；恢复故障使用 ${collaborationTool('respond_agent', Boolean(ctx.collaborationMember))} prepare_restore，审批超出委托范围交给外部 root。无法继续时说明阻塞原因。`,
                 }
-              : reason === 'settled'
+              : readyToSummarize
                 ? {
                     tool: collaborationTool('list_agents', Boolean(ctx.collaborationMember)),
-                    instruction: '检查失败任务、结果与 acceptance 后汇总。',
+                    arguments: { teamId },
+                    instruction:
+                      '监督范围已无未完成工作；逐成员读取 detail=output，检查失败任务、结果与 acceptance 后汇总。结束不等于成功。',
                   }
                 : this.waitAction(ctx, teamId, page.nextCursor);
         return {
@@ -1010,6 +1048,8 @@ export class CollaborationController {
           reason,
           pendingInteractions,
           supervision: {
+            executionSettled,
+            readyToSummarize,
             unfinishedTasks: supervision.unfinishedTasks,
             queuedTasks: supervision.queuedTasks,
             blockedAgents: supervision.blockedAgents,
@@ -1097,7 +1137,8 @@ export class CollaborationController {
   async replayResponse(ctx: Context, args: RespondInput) {
     const { team } = await this.target(ctx, args.target, true);
     await this.renew(ctx, team.id);
-    return this.app.store.replay(this.storage.request(ctx, 'respond_agent', args));
+    const replay = await this.app.store.replay(this.storage.request(ctx, 'respond_agent', args));
+    return replay ? this.responseAction(ctx, team.id, replay) : null;
   }
 
   async respond(ctx: Context, args: RespondInput, logicalArgs: RespondInput = args) {
@@ -1108,10 +1149,10 @@ export class CollaborationController {
       const replay = await this.app.store.replay(
         this.storage.request(ctx, 'respond_agent', logicalArgs),
       );
-      if (replay) return replay;
+      if (replay) return this.responseAction(ctx, team.id, replay);
       if (['closed', 'closing', 'stopping'].includes(agent.lifecycle))
         fail('AGENT_UNAVAILABLE', '成员正在关闭或停止。');
-      let result: unknown;
+      let result: object;
       const execution = {
         ...this.context(team, agent),
         ...((ctx.nativeInteraction ?? false) ? { nativeInteraction: true } : {}),
@@ -1182,13 +1223,14 @@ export class CollaborationController {
           });
         }
       }
+      const response = this.responseAction(ctx, team.id, result);
       // 恢复的外层幂等响应已在 Operation 受理事务中保存，不能留下受理后的回写窗口。
       if (!args.planId)
         await this.app.store.commit({
-          idempotency: this.storage.request(ctx, 'respond_agent', logicalArgs, result),
+          idempotency: this.storage.request(ctx, 'respond_agent', logicalArgs, response),
         });
       this.scheduler.wake();
-      return result;
+      return response;
     });
   }
 
