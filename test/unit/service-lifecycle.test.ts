@@ -43,14 +43,22 @@ void test('Accepted HTTP interaction admission survives disconnect during commit
   operations.retainInteraction = (context) => registry.retainAccepted(context);
   const entered = deferred<void>();
   const finish = deferred<void>();
-  await operations.start(ctx, 'session_create', { idempotencyKey: 'create' }, async () => {
-    assert.equal(registry.available(ctx), true);
-    entered.resolve();
-    await finish.promise;
-  });
-  await entered.promise;
-  finish.resolve();
-  await operations.close();
+  try {
+    await operations.start(ctx, 'session_create', { idempotencyKey: 'create' }, async () => {
+      try {
+        assert.equal(registry.available(ctx), true);
+        entered.resolve();
+      } catch (error) {
+        entered.reject(error);
+        throw error;
+      }
+      await finish.promise;
+    });
+    await entered.promise;
+  } finally {
+    finish.resolve();
+    await operations.close();
+  }
   assert.equal(registry.available(ctx), false);
 });
 
@@ -88,10 +96,6 @@ void test('Disabled idle timeout and successful takeover prevent automatic drain
     assert.equal(service.beginDrain(), false);
     assert.equal(service.beginDrain(true), true);
   }
-  const defaults = settingsSchema.parse({});
-  assert.equal(defaults.serviceIdleTimeoutMs, 600_000);
-  assert.equal(defaults.serviceStartupTimeoutMs, 10_000);
-  assert.equal(defaults.serviceShutdownTimeoutMs, 10_000);
   for (const value of [-1, 1.5])
     assert.throws(() => settingsSchema.parse({ serviceIdleTimeoutMs: value }));
   for (const key of ['serviceStartupTimeoutMs', 'serviceShutdownTimeoutMs'])

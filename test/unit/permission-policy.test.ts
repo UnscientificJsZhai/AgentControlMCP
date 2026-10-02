@@ -142,65 +142,68 @@ void test('Windows environment merging and approval use the same case normalizat
  * @remarks
  * 同名前缀目录、越界路径、空路径和未声明操作不能放行，写入与删除遵循拒绝规则。
  */
-void test('Path authorization enforces directory boundaries, complete path coverage, and operation types', () => {
-  const root = '/workspace/project';
-  const matchesRoot = (path: string, roots: string[]) =>
-    (roots.length ? roots : [root]).some((r) => inside(r, path));
+const policyRoot = '/workspace/project';
+const matchesPolicyRoot = (path: string, roots: string[]) =>
+  (roots.length ? roots : [policyRoot]).some((r) => inside(r, path));
 
-  const readPolicy: PermissionPolicy = {
-    rules: [
-      {
-        id: 'rule-read',
-        effect: 'allow_once',
-        operations: ['read'],
-        roots: [root],
-      },
-      {
-        id: 'rule-deny-write',
-        effect: 'deny',
-        operations: ['write', 'delete'],
-        roots: [root],
-      },
-    ],
-    fallback: 'ask',
-    timeoutMs: null,
-  };
+const readPolicy: PermissionPolicy = {
+  rules: [
+    {
+      id: 'rule-read',
+      effect: 'allow_once',
+      operations: ['read'],
+      roots: [policyRoot],
+    },
+    {
+      id: 'rule-deny-write',
+      effect: 'deny',
+      operations: ['write', 'delete'],
+      roots: [policyRoot],
+    },
+  ],
+  fallback: 'ask',
+  timeoutMs: null,
+};
 
-  // 子路径与子目录完全命中
+void test('Path authorization matches subpaths and subdirectories within the root', () => {
   assert.equal(
-    decide(readPolicy, { operation: 'read', paths: ['/workspace/project/file.txt'] }, matchesRoot),
+    decide(
+      readPolicy,
+      { operation: 'read', paths: ['/workspace/project/file.txt'] },
+      matchesPolicyRoot,
+    ),
     'allow_once',
   );
   assert.equal(
     decide(
       readPolicy,
       { operation: 'read', paths: ['/workspace/project/sub/dir/file.txt'] },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'allow_once',
   );
+});
 
-  // 同名前缀目录（/workspace/project-other）严格隔离，不应匹配
+void test('Path authorization isolates peer directories with similar prefixes and directory traversal', () => {
   assert.equal(
     decide(
       readPolicy,
       { operation: 'read', paths: ['/workspace/project-other/file.txt'] },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'ask',
   );
-
-  // 路径逃逸（.. 越界）不应匹配
   assert.equal(
     decide(
       readPolicy,
       { operation: 'read', paths: ['/workspace/project/../file.txt'] },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'ask',
   );
+});
 
-  // 多路径请求：所有路径必须全部合法才放行
+void test('Multi-path requests require all paths to be valid to permit access', () => {
   assert.equal(
     decide(
       readPolicy,
@@ -208,11 +211,10 @@ void test('Path authorization enforces directory boundaries, complete path cover
         operation: 'read',
         paths: ['/workspace/project/a.txt', '/workspace/project/b.txt'],
       },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'allow_once',
   );
-  // 其中一条路径越界则不获准
   assert.equal(
     decide(
       readPolicy,
@@ -220,25 +222,29 @@ void test('Path authorization enforces directory boundaries, complete path cover
         operation: 'read',
         paths: ['/workspace/project/a.txt', '/etc/passwd'],
       },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'ask',
   );
+});
 
-  // 操作类型匹配与拒绝规则
+void test('Operation type matching enforces declared actions and deny rules', () => {
   assert.equal(
-    decide(readPolicy, { operation: 'write', paths: ['/workspace/project/file.txt'] }, matchesRoot),
+    decide(
+      readPolicy,
+      { operation: 'write', paths: ['/workspace/project/file.txt'] },
+      matchesPolicyRoot,
+    ),
     'deny',
   );
   assert.equal(
     decide(
       readPolicy,
       { operation: 'delete', paths: ['/workspace/project/file.txt'] },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'deny',
   );
-  // 未声明的操作（如 execute）回退到 ask
   assert.equal(
     decide(
       readPolicy,
@@ -247,12 +253,13 @@ void test('Path authorization enforces directory boundaries, complete path cover
         paths: ['/workspace/project/bin'],
         command: { executable: 'bin', args: [] },
       },
-      matchesRoot,
+      matchesPolicyRoot,
     ),
     'ask',
   );
+});
 
-  // 空路径或 null 操作统一返回 ask
-  assert.equal(decide(readPolicy, { operation: 'read', paths: [] }, matchesRoot), 'ask');
-  assert.equal(decide(readPolicy, null, matchesRoot), 'ask');
+void test('Empty paths or null operations fall back to ask', () => {
+  assert.equal(decide(readPolicy, { operation: 'read', paths: [] }, matchesPolicyRoot), 'ask');
+  assert.equal(decide(readPolicy, null, matchesPolicyRoot), 'ask');
 });

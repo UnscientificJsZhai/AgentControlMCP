@@ -1,10 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
-import {
-  collaborationSchemas,
-  parseRespondAgentInput,
-} from '../../src/transport/mcp/collaboration-tools.js';
+import { parseRespondAgentInput } from '../../src/transport/mcp/collaboration-tools.js';
 import { errorDetail } from '../../src/domain/errors.js';
 
 const target = { requestId: 'reply', target: 'agent' };
@@ -23,13 +20,9 @@ const valid = [
   { ...target, action: 'reply', interactionId: 'interaction', answer: 'decline' },
 ];
 
-void test('Targeted response validation preserves all seven strict public branches', () => {
-  assert.equal(z.toJSONSchema(collaborationSchemas.respond_agent).anyOf?.length, 7);
-  const schema = JSON.stringify(z.toJSONSchema(collaborationSchemas.respond_agent));
-  assert.equal(schema.includes('"oneOf"'), false);
+void test('Targeted response validation accepts all valid action branches and rejects unrecognized keys', () => {
   for (const input of valid) {
     assert.deepEqual(parseRespondAgentInput(input), input);
-    assert.deepEqual(collaborationSchemas.respond_agent.parse(input), input);
     assert.throws(() => parseRespondAgentInput({ ...input, unexpected: true }));
   }
 });

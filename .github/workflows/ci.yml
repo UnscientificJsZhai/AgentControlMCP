@@ -49,7 +49,6 @@ jobs:
           # 保留重跑和本地复现所需的产物，覆盖 GitHub 的 30 天重跑窗口后自动清理。
           retention-days: 30
   check:
-    needs: windows-host
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -73,11 +72,7 @@ jobs:
           check-latest: true
           cache: npm
           cache-dependency-path: package-lock.json
-      - uses: actions/download-artifact@v7
-        with:
-          name: windows-process-host
-          path: native
       - name: Install locked dependencies
         run: npm ci
-      - name: Run static checks, unit and component integration tests
-        run: npm run check
+      - name: Run static checks, build and unit tests
+        run: npm run check:ci

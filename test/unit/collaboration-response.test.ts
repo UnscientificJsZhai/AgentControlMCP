@@ -148,13 +148,15 @@ function fixture(t: test.TestContext) {
     const record = (await store.list<InteractionRecord>('interaction')).find(
       (item) => item.state === 'pending',
     )!;
-    t.after(async () => {
+    const cleanup = async () => {
       await interactions.end(record.id, 'cancelled');
-      await response;
-    });
+      await response.catch(() => {});
+    };
+    t.after(cleanup);
     return {
       record,
       response,
+      cleanup,
       choices: permissionResolutionChoices(child.id, record, 'respond_agent'),
     };
   }
@@ -178,38 +180,42 @@ function fixture(t: test.TestContext) {
 void test('A stale permission template is rejected after expiry, connection replacement or delegation revocation', async (t) => {
   for (const boundary of ['expired', 'generation', 'delegation', 'self', 'sibling'] as const) {
     const env = fixture(t);
-    const { record, choices } = await env.open();
-    const args = choices.find((choice) => choice.kind === 'allow_once')!.call.arguments;
-    let ctx = root;
-    let code = 'INTERACTION_EXPIRED';
-    if (boundary === 'expired')
-      await env.store.put('interaction', { ...record, expiresAt: '2000-01-01T00:00:00Z' });
-    if (boundary === 'generation') {
-      const runtime = (await env.store.get<RuntimeRecord>('runtime', record.runtimeId))!;
-      await env.store.put('runtime', { ...runtime, connectionGeneration: 3 });
-      code = 'RUNTIME_GENERATION_CONFLICT';
+    const { record, choices, cleanup } = await env.open();
+    try {
+      const args = choices.find((choice) => choice.kind === 'allow_once')!.call.arguments;
+      let ctx = root;
+      let code = 'INTERACTION_EXPIRED';
+      if (boundary === 'expired')
+        await env.store.put('interaction', { ...record, expiresAt: '2000-01-01T00:00:00Z' });
+      if (boundary === 'generation') {
+        const runtime = (await env.store.get<RuntimeRecord>('runtime', record.runtimeId))!;
+        await env.store.put('runtime', { ...runtime, connectionGeneration: 3 });
+        code = 'RUNTIME_GENERATION_CONFLICT';
+      }
+      if (boundary === 'delegation') {
+        env.revoke();
+        ctx = env.parentContext;
+        code = 'ACCESS_DENIED';
+      }
+      if (boundary === 'self' || boundary === 'sibling') {
+        ctx = {
+          ...root,
+          collaborationMember: {
+            teamId: team.id,
+            agentId: boundary === 'self' ? env.child.id : env.sibling.id,
+          },
+        };
+        code = 'ACCESS_DENIED';
+      }
+      await assert.rejects(env.controller.respond(ctx, args), { code });
+      assert.equal(
+        (await env.store.get<InteractionRecord>('interaction', record.id))!.state,
+        'pending',
+      );
+      assert.equal(env.transactions.length, 0);
+    } finally {
+      await cleanup();
     }
-    if (boundary === 'delegation') {
-      env.revoke();
-      ctx = env.parentContext;
-      code = 'ACCESS_DENIED';
-    }
-    if (boundary === 'self' || boundary === 'sibling') {
-      ctx = {
-        ...root,
-        collaborationMember: {
-          teamId: team.id,
-          agentId: boundary === 'self' ? env.child.id : env.sibling.id,
-        },
-      };
-      code = 'ACCESS_DENIED';
-    }
-    await assert.rejects(env.controller.respond(ctx, args), { code });
-    assert.equal(
-      (await env.store.get<InteractionRecord>('interaction', record.id))!.state,
-      'pending',
-    );
-    assert.equal(env.transactions.length, 0);
   }
 });
 
